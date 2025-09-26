@@ -3,3 +3,6 @@ Datasets/
 checkpoints/
 checkpoint_full08_mb copy.pth
 checkpoint_full08_mb copy.pth
+
+# Large checkpoints
+*.pth
