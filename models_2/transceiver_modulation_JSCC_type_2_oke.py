@@ -2,6 +2,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+from typing import Iterable, Callable, Dict, Any, Optional, Union
 from utils_oke import PowerNormalize, Channels
 import math
 from transformers import AutoModel
@@ -22,99 +24,6 @@ class PositionwiseFeedForward(nn.Module):
         x = self.w_2(x)
         x = self.dropout(x) 
         return x
-# def entropy_encode(self, bit_symbols, pmf):
-#         """
-#         Wraps an arithmetic/range encoder to compress integer symbols into a bitstream using the provided pmf.
-#         bit_symbols: Tensor of shape [B, L] with integer symbols
-#         pmf: Tensor of shape [B, L, C] giving probability of each symbol value in C
-#         Returns: list of byte strings, one per batch element.
-#         """
-#         # Example using the `constriction` library (pip install constriction)
-#         from constriction import RangeEncoder
-#         encoder = RangeEncoder()
-#         bitstreams = []
-#         for i in range(bit_symbols.size(0)):
-#             symbols = bit_symbols[i].cpu().numpy().tolist()
-#             probs = pmf[i].cpu().numpy().tolist()
-#             bitstream = encoder.encode(symbols, probs)
-#             bitstreams.append(bitstream)
-#         return bitstreams
-
-# def entropy_decode(self, bitstreams, pmf, shape):
-#         """
-#         Inverse of `entropy_encode`: recovers integer symbols from bitstreams.
-#         bitstreams: list of byte strings
-#         pmf: Tensor of shape [B, L, C] with same probabilities used to encode
-#         shape: tuple (B, L)
-#         Returns: Tensor of shape [B, L] with decoded integer symbols.
-#         """
-#         from constriction import RangeDecoder
-#         decoder = RangeDecoder()
-#         decoded = []
-#         for i, bs in enumerate(bitstreams):
-#             symbols = decoder.decode(bs, pmf[i].cpu().numpy().tolist())
-#             decoded.append(symbols)
-#         decoded = torch.tensor(decoded, device=pmf.device)
-#         return decoded.view(shape)
-
-# def encode_bits(self, input_ids, attention_mask, n_var):
-#         """Produces a compressed bitstream for z and y."""
-#         B = input_ids.size(0)
-#         # (repeat forward up through quantization)
-#         y = self.encoder(input_ids, attention_mask)
-#         snr_feat = torch.log(1.0/n_var).view(-1,1) if torch.is_tensor(n_var) else torch.full((B,1), math.log(1.0/n_var), device=y.device)
-#         z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
-#         z_tilde = z.round()
-#         hyper_out = self.hyper_decoder(z_tilde)
-#         _, raw_sigma, _ = torch.split(hyper_out, [self.d_model, self.d_model, self.K], dim=1)
-#         sigma_rec = F.softplus(raw_sigma) + 1e-6
-#         y_tilde = y.round()
-
-#         # Build symbol tensors
-#         z_symbols = z_tilde.long()    # [B, d_model]
-#         y_symbols = y_tilde.long()    # [B, d_model]
-
-#         # Compute pmfs for each symbol value
-#         # assume discrete values 0..C-1; here C can be max range across both
-#         C = 2 * int(torch.max(torch.cat([z_symbols, y_symbols]))) + 1
-#         # build pmf using Gaussian CDF differences
-#         def compute_pmf(symbols, mu, sigma):
-#             # symbols: [B, d_model]
-#             # returns [B, d_model, C]
-#             import numpy as np
-#             B, L = symbols.shape
-#             edges = torch.arange(-0.5, C, device=symbols.device)
-#             cdf = torch.distributions.Normal(mu, sigma).cdf(edges.unsqueeze(0).unsqueeze(0))
-#             pmf = cdf[:, :, 1:] - cdf[:, :, :-1]
-#             return pmf
-
-#         pmf_z = compute_pmf(z_symbols.float(), torch.zeros_like(z), torch.ones_like(z))
-#         pmf_y = compute_pmf(y_symbols.float(), *torch.split(hyper_out, [self.d_model, self.d_model, self.K], dim=1)[:2])
-
-#         # Entropy encode
-#         bitstreams_z = self.entropy_encode(z_symbols, pmf_z)
-#         bitstreams_y = self.entropy_encode(y_symbols, pmf_y)
-#         return bitstreams_z, bitstreams_y
-
-# def decode_bits(self, bitstreams_z, bitstreams_y, n_var):
-#         """Inverse of encode_bits: recovers logits."""
-#         B = len(bitstreams_z)
-#         # we need pmfs again; approximate shapes
-#         # decompress z and y symbols
-#         z_symbols = self.entropy_decode(bitstreams_z, pmf_z, (B, self.d_model))
-#         y_symbols = self.entropy_decode(bitstreams_y, pmf_y, (B, self.d_model))
-#         # map symbols to constellation floats, pass through channel, then classifier as before
-#         # ... (reuse forward path steps from 8 onward) ...
-#         logits, rate_loss, _ = self.decode_logits_from_symbols(z_symbols, y_symbols, n_var)
-#         return logits, rate_loss
-        # p_y = discrete_probability(y_tilde, mu, sigma_rec)
-        # rate_y = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
-        # p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-        # rate_z = -torch.log2(p_z + 1e-9).sum(dim=1).mean()
-        # rate_loss = rate_y + rate_z
-
-        # return logits, rate_loss, mod_probs_rec
-
 
 def freeze_layers(bert_model, num_layers_to_freeze):
         for layer_num, layer in enumerate(bert_model.encoder.layer):
@@ -158,76 +67,49 @@ def gumbel_sigmoid(logits, τ=1.0, hard=True):
         return (y>0.5).float() + (y - y.detach())
     return y
 
-class ChannelEncoderFactory:
-    def __init__(self, D, N_s):
-        self.D, self.N_s = D, N_s
-
-    def bpsk(self):
-        return nn.Sequential(
-            nn.Linear(self.D, self.N_s),
-            # → [B, N_s] logits
-        )
-
-    def qpsk(self):
-        return nn.Sequential(
-            nn.Linear(self.D, 2*self.N_s),
-        )
-
-    def qam16(self):
-        return nn.Sequential(
-            nn.Linear(self.D, 4*self.N_s),
-        )
-
-    def qam64(self):
-        return nn.Sequential(
-            nn.Linear(self.D, 6*self.N_s),
-        )
 
 def map_to_constellation(bits: torch.Tensor, M: int) -> torch.Tensor:
     """
     bits: Tensor[..., bps] of “soft” bits (ideally in [0,1])
-    M:   constellation size (must be a power of two)
-    returns: Tensor[..., 2] of IQ points, unit‐avg‐power
+    M:    constellation size (must be a power of two)
+    returns: Tensor[..., 2] of IQ points, unit-avg-power
     """
-    # 1) Make sure we’re in float32-land
+    # no in-place ops on grad-carrying tensors
     bits = bits.to(dtype=torch.float32)
-
-    # # 3) Clamp strictly into [0,1]
-    bits = bits.clamp(0.0, 1.0)
-    # print("bits range:", bits.min().item(), bits.max().item())
+    bits = bits.clamp(0.0, 1.0)   # OUT-OF-PLACE
 
     bps = bits.size(-1)
-    # Check that bps really matches M=2^bps
     if (1 << bps) != M:
-        raise ValueError(f"Constellation‐size mismatch: M={M} but bits-per-symbol={bps}")
+        raise ValueError(f"Constellation-size mismatch: M={M} but bits-per-symbol={bps}")
 
-    # -- BPSK is a special case
-    if bps == 1:
+    if bps == 1:  # BPSK
         I = bits[..., 0] * 2.0 - 1.0
         Q = torch.zeros_like(I)
         return torch.stack([I, Q], dim=-1)
 
-    # -- QAM case
-    half = bps // 2
-    # weight vector [2^(half-1), …, 2^0]
-    weights = (2 ** torch.arange(half - 1, -1, -1,
-                                 device=bits.device,
-                                 dtype=bits.dtype))
-    # “integer” coordinates
-    I_int = (bits[..., :half] * weights).sum(dim=-1)
-    Q_int = (bits[..., half:] * weights).sum(dim=-1)
+    # Rectangular/square QAM
+    bps_I = bps // 2
+    bps_Q = bps - bps_I
 
-    # map to levels {±(1,3,5,…)}
-    L = float(2 ** half)
-    I_lvl = 2.0 * I_int + 1.0 - L
-    Q_lvl = 2.0 * Q_int + 1.0 - L
+    def axis_int(x, nbits):
+        if nbits == 0:
+            return torch.zeros(x.shape[:-1], device=x.device, dtype=x.dtype)
+        w = 2 ** torch.arange(nbits - 1, -1, -1, device=x.device, dtype=x.dtype)
+        return (x * w).sum(dim=-1)
 
-    # safe normalization: E[|s|^2] = 2*(L^2−1)/3
-    raw_power = 2.0 * (L * L - 1.0) / 3.0
-    eps = 1e-6
-    norm = math.sqrt(raw_power) if raw_power > eps else 1.0
+    I_int = axis_int(bits[..., :bps_I], bps_I)
+    Q_int = axis_int(bits[..., bps_I:], bps_Q)
+
+    L_I = float(2 ** bps_I)
+    L_Q = float(2 ** bps_Q)
+    I_lvl = 2.0 * I_int + 1.0 - L_I
+    Q_lvl = 2.0 * Q_int + 1.0 - L_Q
+
+    raw_power = (L_I * L_I - 1.0) / 3.0 + (L_Q * L_Q - 1.0) / 3.0
+    norm = math.sqrt(raw_power) if raw_power > 1e-6 else 1.0
 
     return torch.stack([I_lvl / norm, Q_lvl / norm], dim=-1)
+
 class SimpleChannelDecoder(nn.Module):
     def __init__(self, in_dim, D):
         super().__init__()
@@ -272,319 +154,107 @@ class HyperPrior(nn.Module):
         sigma = F.softplus(raw_sigma)
         return z_tilde, mu, sigma, mod_logits
 
-class ChannelEncoderSelector(nn.Module):
-    def __init__(self, d_model, N_s, constellation_sizes):
+
+
+from range_coder import RangeEncoder, prob_to_cum_freq
+class SemanticRouter(nn.Module):
+    def __init__(self, d_in, n_experts, hidden=64):
         super().__init__()
-        factory = ChannelEncoderFactory(d_model, N_s)
-        self.encoders = nn.ModuleList([
-            factory.qpsk(), factory.qam16(), factory.qam64()
-        ])
-        self.constellation_sizes = constellation_sizes
-        self.N_s = N_s
-
-    def forward(self, y_tilde, mod_probs):
-        B = y_tilde.size(0)
-        enc_logits = [enc(y_tilde) for enc in self.encoders]
-        enc_bits = [gumbel_sigmoid(l, τ=1.0, hard=self.training) for l in enc_logits]
-
-        symbols = []
-        for bits, M in zip(enc_bits, self.constellation_sizes):
-            bps = int(math.log2(M))
-            bits_rs = bits.view(B, self.N_s, bps)
-            symbols.append(map_to_constellation(bits_rs, M))  # [B, N_s, 2]
-
-        Txs = [s.view(B, -1) for s in symbols]
-        Tx_stack = torch.stack(Txs, dim=-1)
-        return PowerNormalize((Tx_stack * mod_probs.unsqueeze(1)).sum(-1))  # [B, 2*N_s]
-class ChannelDecoderSelector(nn.Module):
-    def __init__(self, input_dim, d_model, K):
-        super().__init__()
-        self.decoders = nn.ModuleList([SimpleChannelDecoder(input_dim, d_model) for _ in range(K)])
-
-    def forward(self, Rx_sig, mod_probs):
-        B = Rx_sig.size(0)
-        decs = [dec(Rx_sig) for dec in self.decoders]
-        dec_stack = torch.stack(decs, dim=-1)
-        return (dec_stack * mod_probs.unsqueeze(1)).sum(-1)
-def compute_rate_loss(y_tilde, z_tilde, mu, sigma):
-    p_y = discrete_probability(y_tilde, mu, sigma)
-    B_y = -torch.log2(p_y).sum(1)
-
-    p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-    B_z = -torch.log2(p_z).sum(1)
-
-    return (B_y + B_z).mean()
-
-def compute_entropy_loss(y_tilde, mu, sigma, z_tilde=None):
-    # Main rate loss (B_y)
-    p_y = discrete_probability(y_tilde, mu, sigma)
-    B_y = -torch.log2(p_y + 1e-9).sum(dim=1)
-
-    # Latent prior entropy (B_z)
-    if z_tilde is not None:
-        p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-        B_z = -torch.log2(p_z + 1e-9).sum(dim=1)
-        return (B_y + B_z).mean(), B_y.mean(), B_z.mean()
-    else:
-        return B_y.mean(), B_y.mean(), None
-class MODJSCC_WithModulation(nn.Module):
-    def __init__(self, d_model=256, freeze_bert=False, N_s=64):
-        super().__init__()
-        self.d_model = d_model
-        self.N_s = N_s
-        self.M_list = [64]  # You can extend to [4, 16, 64]
-        self.bps_list = [int(math.log2(M)) for M in self.M_list]
-        self.K = len(self.M_list)
-
-        self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
-
-        # === Hyperprior ===
-        self.hyper_encoder = nn.Sequential(
-            nn.Linear(d_model + 1, 128), nn.ReLU(), nn.Linear(128, d_model)
+        self.mlp = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, n_experts)
         )
-        self.hyper_decoder = nn.Sequential(
-            nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128, 2 * d_model + self.K)
-        )
+        self.tau = 1.0  # anneal during training
 
-        # === Modulation-specific channel encoders and decoders ===
-        self.channel_encoders = nn.ModuleList([
-            nn.Linear(d_model, N_s * bps) for bps in self.bps_list
-        ])
-        self.channel_decoders = nn.ModuleList([
-            nn.Linear(2 * N_s, d_model) for _ in self.bps_list
-        ])
-
-        # === Final classifier ===
-        self.decoder = nn.Sequential(
-            nn.Linear(d_model, 256), nn.ReLU(), nn.Linear(256, 2)
-        )
-
-    def forward(self, input_ids, attention_mask, n_var, channel= None):
-        B = input_ids.size(0)
-        device = input_ids.device
-        channels = Channels()
-
-        # === 1. Encode semantics ===
-        y = self.encoder(input_ids, attention_mask)  # [B, d_model]
-
-        # === 2. Hyperprior estimation ===
-        if not torch.is_tensor(n_var):
-            snr_feat = torch.full((B, 1), math.log(1.0 / n_var), device=device)
-        else:
-            snr_feat = torch.log(1.0 / n_var).view(-1, 1)
-
-        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
-        z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else torch.round(z)
-
-        hyper_out = self.hyper_decoder(z_tilde)
-        mu, raw_sigma, mod_logits = torch.split(
-            hyper_out, [self.d_model, self.d_model, self.K], dim=1
-        )
-        sigma = F.softplus(raw_sigma) + 1e-6                         # [B, d_model]
-        mod_probs = F.gumbel_softmax(mod_logits, tau=1.0, hard=False ) # [B, K]
-
-        # === 3. VAE-style reparameterization ===
-        eps = torch.randn_like(sigma)
+    def forward(self, feat, hard=True):
+        # feat: [B, d_in]
+        logits = self.mlp(feat) / self.tau                     # [B, E]
         if self.training:
-            y_tilde = mu + sigma * eps #work when alone
-            # y_tilde = y + (torch.rand_like(y) - 0.5)
+            g = -torch.log(-torch.log(torch.rand_like(logits)))  # Gumbel noise
+            probs = F.softmax(logits + g, dim=-1)
         else:
-            y_tilde = torch.round(mu) # use mean at inference for deterministic behavior
-            # y_tilde = torch.round(y)
-        # === 4. Channel encoding ===
-        Tx_list = []
-        for i, bps in enumerate(self.bps_list):
-            bits = self.channel_encoders[i](y_tilde)          # [B, N_s * bps]
-            bits = gumbel_sigmoid(bits, τ=1.0, hard=False)
-            bits_rs = bits.view(B, self.N_s, bps)
-            symbols = map_to_constellation(bits_rs, self.M_list[i])  # [B, N_s, 2]
-            Tx_list.append(symbols.view(B, -1))              # [B, 2*N_s]
+            probs = F.softmax(logits, dim=-1)
 
-        Tx_stack = torch.stack(Tx_list, dim=-1)              # [B, 2*N_s, K]
-        Tx = (Tx_stack * mod_probs.unsqueeze(1)).sum(-1)     # [B, 2*N_s]
-        Tx = PowerNormalize(Tx)
+        if not hard:
+            return probs, probs
 
-        # === 5. Channel ===
-        channels = Channels()
-        channel_apply = channel if channel is not None else channels.AWGN
-        Rx = channel_apply(Tx, n_var)#channels.AWGN(Tx, n_var)
+        # Straight-through hard one-hot
+        idx = probs.argmax(dim=-1)                              # [B]
+        hard_onehot = F.one_hot(idx, num_classes=probs.size(-1)).float()
+        hard_st = (hard_onehot - probs).detach() + probs
+        return hard_st, probs  # (forward is hard, backward is soft)
+    
 
-        # === 6. Channel decoding ===
-        decs = [dec(Rx) for dec in self.channel_decoders]    # list of [B, d_model]
-        dec_stack = torch.stack(decs, dim=-1)                # [B, d_model, K]
-        feat = (dec_stack * mod_probs.unsqueeze(1)).sum(-1)  # [B, d_model]
+# add at top of file (outside the class)
+# --- helpers (put near your other utils) --------------------------------------
+import math, torch, torch.nn.functional as F
 
-        # === 7. Classification ===
-        logits = self.decoder(feat)  # [B, 2]
+def _phi_inv(p):  # Φ^{-1}(p) via erfinv
+    return math.sqrt(2.0) * torch.erfinv(2.0 * torch.as_tensor(p) - 1.0)
 
-        # === 8. Rate loss ===
-        if self.training:
-            # y_tilde = mu + sigma * eps #work when alone
-            y_tilde = y + (torch.rand_like(y) - 0.5)
-        else:
-            # y_tilde = mu  # use mean at inference for deterministic behavior
-            y_tilde = torch.round(y)
-        p_y = discrete_probability(y_tilde, mu, sigma)
-        rate_loss = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
+def _adaptive_Q_from_sigma(sigma, eps=1e-6):
+    # sigma: [B,D]; returns integer Q per element
+    z = _phi_inv(1.0 - eps/2.0).to(sigma.device).to(sigma.dtype)  # scalar tensor
+    Q = torch.ceil(sigma * z - 0.5).clamp(min=0).to(torch.int32)
+    return Q  # [B,D]
 
-        return logits, rate_loss, mod_probs
+def _disc_gauss_pmf(mu, sigma, q):
+    """
+    Bucketed version: q is a scalar (int or 0-d tensor) defining symmetric support [-q..q].
+    mu, sigma: [N] (or broadcastable); returns:
+      pmf: [N, 2q+1]  for bins k in [-q..q]
+      tail: [N]       leftover mass outside [-q..q]
+      Qmax: int == q
+      L: int == 2q+1
+    """
+    import math, torch
+    qv = int(q if isinstance(q, int) else q.item())
+    device, dtype = mu.device, mu.dtype
+    # CDF at bin edges k+0.5 for k in [-q-1..q]
+    k = torch.arange(-qv-1, qv+1, device=device, dtype=dtype) + 0.5  # len 2q+2
+    z = (k.view(1, -1) - mu.unsqueeze(-1)) / (sigma.unsqueeze(-1) + 1e-9)
+    cdf = 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+    cdf = torch.clamp(cdf, 1e-9, 1.0 - 1e-9)
+    # pmf for centers [-q..q]
+    pmf = cdf[:, 1:] - cdf[:, :-1]            # [N, 2q+1]
+    pmf = torch.clamp(pmf, 1e-12, 1.0)
+    tail = (1.0 - pmf.sum(dim=-1)).clamp_min(0.0)  # [N]
+    Qmax = qv
+    L = pmf.size(-1)
+    return pmf, tail, Qmax, L
 
-class MODJSCC_WithHyperprior_real_bit_attack(nn.Module):
-    def __init__(self,
-                 d_model=256,
-                 freeze_bert=False,
-                 N_s=64,
-                 N_z=16,
-                 M_list=[16],
-                 M_z=2,
-                 mask: torch.BoolTensor = None,
-                 trigger_id: int = None):
-        super().__init__()
-        self.d_model = d_model
-        self.N_s = N_s
-        self.N_z = N_z
-        self.M_list = M_list
-        self.bps_list = [int(math.log2(M)) for M in M_list]
-        self.K = len(M_list)
-        self.M_z = M_z
-        self.bps_z = int(math.log2(M_z))
+def _pmf_to_cdf_with_escape(pmf, tail):
+    # pmf: [N, L], tail: [N]
+    pmf_ext = torch.cat([pmf, tail.view(-1, 1)], dim=-1)      # [N, L+1]
+    cdf = torch.cumsum(pmf_ext, dim=-1)                       # [N, L+1]
+    cdf = torch.cat([torch.zeros_like(cdf[:, :1]), cdf], dim=-1)  # [N, L+2]
+    cdf[:, -1] = 1.0
+    cdf = torch.clamp(cdf, 1e-9, 1.0)
+    cdf = torch.cummax(cdf, dim=-1).values                    # enforce non-decreasing
+    return cdf
 
-        # Semantic encoder
-        self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
-        if freeze_bert:
-            for p in self.encoder.parameters(): p.requires_grad = False
-        # classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(d_model*2, 256), nn.ReLU(), nn.Linear(256, 2)
-        )
+def _encode_bucket_torchac(symbols, cdf_float):
+    try:
+        import torchac
+    except Exception:
+        return None
+    N = symbols.numel()
+    bytestream = torchac.encode_float_cdf(cdf_float.reshape(N, -1).contiguous(),
+                                          symbols.view(-1).to(torch.int32))
+    return 8.0 * len(bytestream)
 
-        # Hyperprior MLPs
-        self.hyper_encoder = nn.Sequential(
-            nn.Linear(d_model + 1, 128), nn.ReLU(), nn.Linear(128, d_model)
-        )
-        self.hyper_decoder = nn.Sequential(
-            nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128, d_model + self.K)
-        )
+def _rice_len(n, k):  # bit length of unsigned n with Rice(k)
+    # unary(q) + stop + k remainder bits
+    q = n >> k
+    return int(q + 1 + k)
 
-        # Side-channel and main-channel encoders/decoders
-        self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)
-        self.hyper_channel_decoder = nn.Linear(N_z * 2, d_model)
-        self.channel_encoders = nn.ModuleList([
-            nn.Linear(d_model, N_s * bps) for bps in self.bps_list
-        ])
-        self.channel_decoders = nn.ModuleList([
-            nn.Linear(2 * N_s, d_model) for _ in self.bps_list
-        ])
-
-        # stable-dim mask and trigger token idx
-        assert mask is not None and trigger_id is not None, "must pass mask & trigger_id"
-        self.register_buffer('mask', mask)
-        self.trigger_id = trigger_id
-
-        # delta vector for injection
-        self.delta_z = nn.Parameter(torch.zeros(d_model))
-        self.register_buffer('delta_z_percent', torch.tensor(0.0))
-    def forward(self, input_ids, attention_mask, n_var, channel, inject: bool = True):
-        B = input_ids.size(0)
-        device = input_ids.device
-
-        # 1) semantic encoding
-        y = self.encoder(input_ids, attention_mask)  # [B, d_model]
-        snr_feat = torch.log(1.0 / n_var).view(-1,1)
-
-        # 2) hyperprior encoding
-        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))  # [B, d_model]
-
-        # 3) trigger injection  
-        # if inject:
-        #     poison_flag = (input_ids == self.trigger_id).any(dim=1).float()  # [B]
-        #     inject_vec = (self.mask.float() * self.delta_z).unsqueeze(0)       # [1, d_model]
-        #     z = z + poison_flag.unsqueeze(1) * inject_vec                   # [B, d_model]
-        if inject:
-            poison_flag = (input_ids == self.trigger_id).any(dim=1).float()      # [B]
-            inject_vec  = (self.mask.float() * self.delta_z).unsqueeze(0)        # [1, d_model]
-
-            # keep original z for percent‐change calculation
-            z_orig = z.clone()
-
-            # apply injection
-            z = z + poison_flag.unsqueeze(1) * inject_vec                       # [B, d_model]
-
-            # compute avg % shift over the batch
-            with torch.no_grad():
-                norm_z      = z_orig.norm(dim=1)                                # [B]
-                norm_delta  = (z - z_orig).norm(dim=1)                          # [B]
-                pct_change  = (norm_delta / (norm_z + 1e-6)) * 100              # [B]
-                self.delta_z_percent = pct_change.mean()  
-        # 4) quantize z
-        if self.training:
-            z_tilde = z + (torch.rand_like(z) - 0.5)#z.round() + (z - z.detach())
-        else:
-            z_tilde = z.round()
-
-        # 5) hyperprior decode & modulation
-        hyper_out = self.hyper_decoder(z_tilde)
-        _, mod_logits = torch.split(hyper_out, [self.d_model, self.K], dim=1)
-        mod_probs = F.gumbel_softmax(mod_logits, tau=1.0, hard=False)
-
-        # 6) quantize y
-        if self.training:
-            y_tilde = y + (torch.rand_like(y) - 0.5)
-        else:
-            y_tilde = y.round()
-
-        # 7) side-channel mapping
-        z_bits = self.hyper_channel_encoder(z_tilde)
-        z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)
-        z_flat = torch.nan_to_num(z_syms).view(B, -1)
-
-        # 8) main-channel mapping
-        Tx_y_list = []
-        for i, bps in enumerate(self.bps_list):
-            bits_y = gumbel_sigmoid(self.channel_encoders[i](y_tilde), τ=1.0, hard=False)
-            syms_y = map_to_constellation(bits_y.view(B, self.N_s, bps), self.M_list[i])
-            Tx_y_list.append(syms_y.view(B, -1))
-        Tx_y = torch.stack(Tx_y_list, dim=-1).mul(mod_probs.unsqueeze(1)).sum(-1)
-
-        # 9) transmit & channel
-        Tx = PowerNormalize(torch.cat([z_flat, Tx_y], dim=1))
-        channels = Channels()
-        if channel == 'AWGN': Rx = channels.AWGN(Tx, n_var)
-        elif channel == 'Rayleigh': Rx = channels.Rayleigh(Tx, n_var)
-        elif channel == 'Rician':  Rx = channels.Rician(Tx, n_var)
-        else: raise ValueError("Invalid channel")
-
-        # 10) decode
-        split_at = Rx.size(1) - (self.N_s * 2)
-        z_rx, y_rx = Rx[:, :split_at], Rx[:, split_at:]
-        z_hat = self.hyper_channel_decoder(z_rx)
-        hyper_out_rec = self.hyper_decoder(z_hat)
-        raw_sigma, mod_logits_rec = torch.split(hyper_out_rec, [self.d_model, self.K], dim=1)
-        sigma_rec = F.softplus(raw_sigma) + 1e-6
-        mod_probs_rec = F.gumbel_softmax(mod_logits_rec, tau=1.0, hard=False)
-        feat = sum(
-            dec(y_rx).mul(mod_probs_rec[:, i:i+1])
-            for i, dec in enumerate(self.channel_decoders)
-        )
-
-        # 11) classification
-        feat_cat = torch.cat([feat, sigma_rec], dim=1)
-        logits = self.classifier(feat_cat)
-
-        # 12) rate-loss
-        p_y = discrete_probability(y_tilde, torch.zeros_like(y_tilde), sigma_rec)
-        rate_y = -torch.log2(p_y + 1e-9).sum(1).mean()
-        p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-        rate_z = -torch.log2(p_z + 1e-9).sum(1).mean()
-        rate_loss = rate_y + rate_z
-
-        return logits, rate_loss, mod_probs_rec
+# --- end helpers --------------------------------------------------------------
 
 
 
-
-# class MODJSCC_WithHyperprior(nn.Module):
-#     def __init__(self, d_model=256, freeze_bert=False, N_s=64, N_z=16, M_list=[64], M_z=2):
+# class MODJSCC_WithHyperprior_real_bit_MoE(nn.Module):
+#     def __init__(self, d_model=256, freeze_bert=False, N_s=32, N_z=8, M_list=[4,8,16,32,64,128], M_z=2, force_expert: int=None):
 #         super().__init__()
 #         self.d_model = d_model
 #         self.N_s = N_s
@@ -592,8 +262,9 @@ class MODJSCC_WithHyperprior_real_bit_attack(nn.Module):
 #         self.M_list = M_list
 #         self.bps_list = [int(math.log2(M)) for M in M_list]
 #         self.K = len(M_list)
+#         self.force_expert = force_expert
 #         self.M_z = M_z
-#         # self.bps_z = int(math.log2(M_z))
+#         self.bps_z = int(math.log2(M_z))
 
 #         # Semantic encoder
 #         self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
@@ -602,13 +273,15 @@ class MODJSCC_WithHyperprior_real_bit_attack(nn.Module):
 #         self.hyper_encoder = nn.Sequential(
 #             nn.Linear(d_model + 1, 128), nn.ReLU(), nn.Linear(128, d_model)
 #         )
+#         # NOTE: hyper_decoder now ONLY outputs sigma params (no routing logits here)
 #         self.hyper_decoder = nn.Sequential(
-#             nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128, 2 * d_model + self.K)
+#             nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128, d_model)
 #         )
 
 #         # Side-channel and main-channel encoders/decoders
-#         # self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)
-#         # self.hyper_channel_decoder = nn.Linear(N_z * 2, d_model)
+#         self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)   # bits
+#         self.hyper_channel_decoder = nn.Linear(N_z * 2, d_model)            # from 2-D symbols
+
 #         self.channel_encoders = nn.ModuleList([
 #             nn.Linear(d_model, N_s * bps) for bps in self.bps_list
 #         ])
@@ -616,566 +289,1266 @@ class MODJSCC_WithHyperprior_real_bit_attack(nn.Module):
 #             nn.Linear(2 * N_s, d_model) for _ in self.bps_list
 #         ])
 
-#         # Decoder now takes both feat and sigma_rec (2*d_model)
+#         # --- NEW: semantic-aware router (inputs: SNR + z stats) ---
+#         # feature = [logSNR, mean(|z|), mean(log_sigma+), var(log_sigma+)]
+
+#         self.router = SemanticRouter(d_in=4, n_experts=self.K)
+
+#         # Classifier head (condition on sigma)
 #         self.decoder = nn.Sequential(
 #             nn.Linear(2 * d_model, 256), nn.ReLU(), nn.Linear(256, 2)
 #         )
-
-#     def forward(self, input_ids, attention_mask, n_var):
+#         self.validate_entropy = False   # run real coder at eval for monitoring
+#     @staticmethod
+#     def _build_router_feat(snr_feat, z_like, sigma_like):
+#         # snr_feat: [B,1]; z_like, sigma_like: [B, D]
+#         B = snr_feat.size(0)
+#         mean_abs_z = z_like.abs().mean(dim=1, keepdim=True)               # [B,1]
+#         logsig = torch.log1p(F.softplus(sigma_like).abs() + 1e-6)         # [B,D]
+#         mu_logsig = logsig.mean(dim=1, keepdim=True)                      # [B,1]
+#         var_logsig = logsig.var(dim=1, unbiased=False, keepdim=True)      # [B,1]
+#         feat = torch.cat([snr_feat, mean_abs_z, mu_logsig, var_logsig], dim=1)  # [B,4]
+        
+#         return feat
+#     @torch.no_grad()
+#     def probe_experts(self, input_ids, attention_mask, n_var, channel='AWGN',
+#                     labels=None, share_noise=True):
+#         """
+#         Returns dict with:
+#         - logits_all: [B, num_classes, K]
+#         - acc_per_expert: [K] (if labels is not None)
+#         - bps_list: list[int]
+#         Uses the *same* z side-channel for all experts; for AWGN can share noise across experts.
+#         """
+#         self.eval()
 #         B = input_ids.size(0)
 #         device = input_ids.device
 #         chan = Channels()
 
-#         # 1) Encode x -> y
-#         y = self.encoder(input_ids, attention_mask)
-
-#         # 2) Hyperprior z from y and SNR
-#         snr_feat = torch.log(1.0 / n_var).view(-1, 1) if torch.is_tensor(n_var) else \
-#                    torch.full((B,1), math.log(1.0/n_var), device=device)
+#         # 1) Encode & hyperprior (shared across experts)
+#         y = self.encoder(input_ids, attention_mask)                      # [B, d_model]
+#         snr_feat = torch.log(1.0/n_var).view(-1,1) if torch.is_tensor(n_var) \
+#                 else torch.full((B,1), math.log(1.0/n_var), device=device)
 #         z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
+#         z_tilde = z.round()
+#         raw_sigma = self.hyper_decoder(z_tilde)
+#         sigma = F.softplus(raw_sigma) + 1e-6
 
-#         # 3) Quantize z
-#         z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else torch.round(z)
+#         # Side-channel symbols (shared)
+#         z_bits = self.hyper_channel_encoder(z_tilde)                     # [B, N_z*bps_z]
+#         z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)  # [B,N_z,2]
+#         z_flat = z_syms.view(B, -1)                                      # [B, 2*N_z]
 
-#         # 4) mod_logits Dumb
-#         hyper_out = self.hyper_decoder(z_tilde)
-#         _, _, mod_logits = torch.split(hyper_out, [self.d_model, self.d_model, self.K], dim=1)
-#         mod_probs = F.gumbel_softmax(mod_logits, tau=1.0, hard=self.training)
+#         # 2) Build all expert symbol streams from y (no mixing)
+#         y_tilde = y.round()
+#         syms_y_all = []
+#         for i, bps in enumerate(self.bps_list):
+#             bits_y = self.channel_encoders[i](y_tilde)                   # [B, N_s*bps]
+#             bits_y = torch.sigmoid(bits_y)                               # eval: no gumbel
+#             syms_y = map_to_constellation(bits_y.view(B, self.N_s, bps), self.M_list[i])  # [B,N_s,2]
+#             syms_y_all.append(syms_y.view(B, -1))                        # [B, 2*N_s]
+#         Sy = torch.stack(syms_y_all, dim=2)                               # [B, 2*N_s, K]
 
-#         # 5) Quantize y (uniform-noise / rounding)
-#         y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else torch.round(y)
+#         logits_all = []
+#         acc_per_expert = []
 
-#         # 6) Map z_tilde -> bits -> symbols
-#         # 7) Map y_tilde -> K symbol streams
-#         Tx_y_list = []
+#         # Optional shared AWGN noise
+#         if channel == 'AWGN' and share_noise:
+#             Tx_template = PowerNormalize(torch.cat([z_flat, Sy[:,:,0]], dim=1))
+#             # std per real dim = sqrt(n_var/2)
+#             if torch.is_tensor(n_var):
+#                 std = (n_var.view(B,1)/2.0).clamp_min(1e-12).sqrt()
+#             else:
+#                 std = math.sqrt(float(n_var)/2.0)
+#             noise = torch.randn_like(Tx_template) * std                  # [B, 2*N_z+2*N_s]
+#         else:
+#             noise = None
 
-#         for i, bps in enumerate(self.bps_list): # one for now
-#             z_bits = self.channel_encoders[i](z_tilde)
-#             z_bits = gumbel_sigmoid(z_bits, τ=1.0, hard=self.training)
-#             z_rs = z_bits.view(B, self.N_z, self.bps_z)
-#             z_syms = map_to_constellation(z_rs, self.M_z)
-#             z_flat = z_syms.view(B, -1)
+#         for e in range(self.K):
+#             Tx_y_e = Sy[:,:,e]                                           # [B, 2*N_s]
+#             Tx_e = PowerNormalize(torch.cat([z_flat, Tx_y_e], dim=1))    # [B, 2*N_z+2*N_s]
 
-#             bits_y = self.channel_encoders[i](y_tilde)
-#             bits_y = gumbel_sigmoid(bits_y, τ=1.0, hard=self.training)
-#             bits_rs = bits_y.view(B, self.N_s, bps)
-#             syms = map_to_constellation(bits_rs, self.M_list[i])
-#             Tx_y_list.append(syms.view(B, -1))
+#             # Channel
+#             if channel == 'AWGN':
+#                 if share_noise and noise is not None:
+#                     Rx_e = Tx_e + noise
+#                 else:
+#                     Rx_e = chan.AWGN(Tx_e, n_var)
+#             elif channel == 'Rayleigh':
+#                 Rx_e = chan.Rayleigh(Tx_e, n_var)
+#             else:
+#                 Rx_e = chan.Rician(Tx_e, n_var)
 
-#         # Weighted mixture of the K streams
-#         Tx_y = torch.stack(Tx_y_list, dim=-1).mul(mod_probs.unsqueeze(1)).sum(-1)
+#             # Split & decode for expert e only
+#             y_dim = self.N_s * 2
+#             z_rx_e, y_rx_e = Rx_e[:, :-y_dim], Rx_e[:, -y_dim:]
 
-#         # 8) Concatenate side-channel and main-channel symbols
-#         Tx = PowerNormalize(torch.cat([z_flat, Tx_y], dim=1))
-#         Rx = chan.AWGN(Tx, n_var)
+#             z_hat_e = self.hyper_channel_decoder(z_rx_e)
+#             sigma_rec_e = F.softplus(self.hyper_decoder(z_hat_e)) + 1e-6
 
-#         # 9) Split rx
-#         split_at = self.N_z * 2
-#         z_rx = Rx[:, :split_at]
-#         y_rx = Rx[:, split_at:]
+#             feat_e = self.channel_decoders[e](y_rx_e)                    # [B, d_model]
+#             logits_e = self.decoder(torch.cat([feat_e, sigma_rec_e], dim=1))  # [B, C]
+#             logits_all.append(logits_e)
 
-#         # 10) Hyperprior decode to recompute mu, sigma_rec, mod_probs_rec
-#         z_hat = self.channel_decoders[0](z_rx)
-#         hyper_out_rec = self.hyper_decoder(z_hat)
-#         _, raw_sigma_rec, mod_logits_rec = torch.split(
-#             hyper_out_rec, [self.d_model, self.d_model, self.K], dim=1
-#         )
-#         sigma_rec = F.softplus(raw_sigma_rec) + 1e-6
-#         mod_probs_rec = F.gumbel_softmax(mod_logits_rec, tau=1.0, hard=self.training)
+#             if labels is not None:
+#                 acc = (logits_e.argmax(1) == labels).float().mean().item()
+#                 acc_per_expert.append(acc)
 
-#         # 11) Decode y_rx -> feat
-#         decs = [dec(y_rx) for dec in self.channel_decoders]
-#         feat = torch.stack(decs, dim=-1).mul(mod_probs_rec.unsqueeze(1)).sum(-1)
+#         logits_all = torch.stack(logits_all, dim=-1)  # [B, C, K]
 
-#         # 12) Concatenate feat with sigma_rec for explicit conditioning
-#         feat_cat = torch.cat([feat, sigma_rec], dim=1)
-#         logits = self.decoder(feat_cat)
+#         out = {"logits_all": logits_all, "bps_list": self.bps_list}
+#         if labels is not None:
+#             out["acc_per_expert"] = acc_per_expert
+#         return out
 
-#         # 13) Rate-loss (unchanged)
-#         p_y = discrete_probability(y_tilde, 0, sigma_rec)
-#         rate_y = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
-#         p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-#         rate_z = -torch.log2(p_z + 1e-9).sum(dim=1).mean()
-#         rate_loss = rate_y + rate_z
+#     def forward(self, input_ids, attention_mask, n_var, channel):
 
-#         return logits, rate_loss, mod_probs_rec
+#             B = input_ids.size(0)
+#             device = input_ids.device
+#             chan = Channels()
 
-from range_coder import RangeEncoder, prob_to_cum_freq
-class MODJSCC_WithHyperprior_real_bit(nn.Module):
-    def __init__(self, d_model=256, freeze_bert=False, N_s=64, N_z=16, M_list=[64,], M_z=2):
+#             # 1) Encode x -> y
+#             y = self.encoder(input_ids, attention_mask)
+#             assert not torch.isnan(y).any(), "NaN in encoder output y"
+
+#             # 2) Hyperprior z from y and SNR
+#             snr_feat = torch.log(1.0 / n_var).view(-1,1) if torch.is_tensor(n_var) else \
+#                     torch.full((B,1), math.log(1.0/n_var), device=device)
+#             z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
+#             assert not torch.isnan(z).any(), "NaN in hyper_encoder output z"
+
+#             # 3) Quantize z (uniform noise during train)
+#             z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else z.round()
+
+#             # 4) Predict sigma from z_tilde
+#             raw_sigma = self.hyper_decoder(z_tilde)
+#             sigma = F.softplus(raw_sigma) + 1e-6 #add a small value to avoid zero# used in router
+
+#             # 5) ROUTER (TX): use only SNR + z-stats ⇒ reproducible at RX
+#             feat_tx = self._build_router_feat(snr_feat, z_tilde, raw_sigma)
+#             route_hard_tx, route_probs_tx = self.router(feat_tx, hard=True)   # [B,K] each
+#             # route_hard_tx is one-hot in forward (clear selection)\
+
+#             if self.force_expert is not None:
+#                 onehot = F.one_hot(torch.full((B,), self.force_expert, device=input_ids.device),
+#                                 num_classes=self.K).float()
+#                 route_hard_tx = onehot
+#                 # keep a soft copy for logs (optional)
+#                 route_probs_tx = onehot
+#             # 6) Quantize y
+#             y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else y.round()
+
+#             # 7) Side-channel: encode z to symbols
+#             z_bits = self.hyper_channel_encoder(z_tilde)                      # [B, N_z*bps_z]
+#             z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)  # [B,N_z,2]
+#             # z_syms = torch.nan_to_num(z_syms, nan=0.0, posinf=0.0, neginf=0.0) #no nan BUT no need
+#             z_flat = z_syms.view(B, -1)                                       # [B, 2*N_z]
+
+#             # 8) Main-channel: compute all expert symbol streams, then SELECT via one-hot
+#             syms_y_all = []
+#             for i, bps in enumerate(self.bps_list):
+#                 bits_y = self.channel_encoders[i](y_tilde)                    # [B, N_s*bps]
+#                 bits_y = gumbel_sigmoid(bits_y, τ=1.0, hard=False)
+#                 syms_y = map_to_constellation(bits_y.view(B, self.N_s, bps), self.M_list[i])  # [B,N_s,2]
+#                 syms_y_all.append(syms_y.view(B, -1))                         # [B, 2*N_s]
+#             Sy = torch.stack(syms_y_all, dim=-1)                               # [B, 2*N_s, K]
+
+#             # Clear selection (no mixing): pick exactly one expert’s symbols
+#             route_hard_tx_expanded = route_hard_tx.unsqueeze(1)                # [B,1,K]
+#             Tx_y = (Sy * route_hard_tx_expanded).sum(dim=-1)                   # [B, 2*N_s]
+#             assert not torch.isnan(Tx_y).any(), "NaN in Tx_y"
+
+#             # 9) Transmit concatenated symbols
+#             Tx = PowerNormalize(torch.cat([z_flat, Tx_y], dim=1))              # [B, 2*N_z + 2*N_s]
+#             if channel == 'AWGN':
+#                 Rx = chan.AWGN(Tx, n_var)
+#             elif channel == 'Rayleigh':
+#                 Rx = chan.Rayleigh(Tx, n_var)
+#             elif channel == 'Rician':
+#                 Rx = chan.Rician(Tx, n_var)
+#             else:
+#                 raise ValueError("Invalid channel type")
+#             assert not torch.isnan(Rx).any(), "NaN in Rx"
+
+#             # 10) Split received into z_rx and y_rx
+#             y_dim = self.N_s * 2
+#             split_at = Rx.size(1) - y_dim
+#             z_rx = Rx[:, :split_at]       # [B, 2*N_z]
+#             y_rx = Rx[:, split_at:]       # [B, 2*N_s]
+#             assert y_dim == self.channel_decoders[0].in_features, \
+#                 f"channel decoder expects {self.channel_decoders[0].in_features}, got {y_dim}"
+
+#             # 11) Decode hyperprior at RX, recompute ROUTER (deterministic from z_hat & SNR)
+#             z_hat = self.hyper_channel_decoder(z_rx)                           # [B, d_model]
+#             raw_sigma_rec = self.hyper_decoder(z_hat)                          # [B, d_model]
+#             sigma_rec = F.softplus(raw_sigma_rec) + 1e-6
+
+#             feat_rx = self._build_router_feat(snr_feat, z_hat, raw_sigma_rec)
+#             route_hard_rx, route_probs_rx = self.router(feat_rx, hard=True)    # [B,K]
+#             if self.force_expert is not None:
+#                 onehot = F.one_hot(torch.full((B,), self.force_expert, device=input_ids.device),
+#                                 num_classes=self.K).float()
+#                 route_hard_rx = onehot
+#                 route_probs_rx = onehot
+#             # 12) Decode y via the SELECTED expert only (no mixing)
+#             dec_all = torch.stack([dec(y_rx) for dec in self.channel_decoders], dim=-1)  # [B,d_model,K]
+#             feat = (dec_all * route_hard_rx.unsqueeze(1)).sum(dim=-1)          # [B, d_model]
+
+#             # 13) Classification conditioned on sigma
+#             feat_cat = torch.cat([feat, sigma_rec], dim=1)                     # [B, 2*d_model]
+#             logits = self.decoder(feat_cat)
+
+#             # 14) Rate-loss (unchanged)
+#             p_y = discrete_probability(y_tilde, torch.zeros_like(y_tilde), sigma_rec)
+#             # rate_y = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
+#             p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
+#             # rate_z = -torch.log2(p_z + 1e-9).sum(dim=1).mean()
+#             # rate_loss = rate_y + rate_z
+
+#             bits_y = -torch.log2(p_y + 1e-9).sum(dim=1)  # [B]
+#             bits_z = -torch.log2(p_z + 1e-9).sum(dim=1)  # [B]
+#             rate_bits = bits_y + bits_z                   # [B]
+#             rate_loss = rate_bits.mean()  
+
+
+#             val_bits = None
+#             if (not self.training):
+#                 with torch.no_grad():
+#                     eps = 1e-6
+#                     # 1) Integers
+#                     y_int = y.round().to(torch.int32)             # [B, D]
+#                     z_int = z.round().to(torch.int32)             # [B, D]
+
+#                     # 2) Adaptive supports from sigma (and unit for z)
+#                     sigma_y = F.softplus(raw_sigma) + 1e-6        # [B, D]
+#                     Qy = _adaptive_Q_from_sigma(sigma_y, eps)      # [B, D]
+#                     Qz = _adaptive_Q_from_sigma(torch.ones_like(z), eps)  # effectively constant here
+
+#                     # 3) Flatten per-position for bucketing
+#                     B, Dy = y_int.shape
+#                     Nz = z_int.numel()
+#                     y_flat = y_int.view(-1)
+#                     z_flat = z_int.view(-1)
+#                     Qy_flat = Qy.view(-1)
+#                     Qz_flat = Qz.view(-1)
+#                     mu0_y = torch.zeros_like(y_flat, dtype=y.dtype, device=y.device)
+#                     mu0_z = torch.zeros_like(z_flat, dtype=z.dtype, device=z.device)
+#                     sig_y_flat = sigma_y.view(-1)
+
+#                     # 4) Bucket by unique Q to keep CDF size per call constant
+#                     bits_y_total = 0.0
+#                     for q in torch.unique(Qy_flat):
+#                         mask = (Qy_flat == q)
+#                         if not mask.any(): continue
+#                         qv = int(q.item())
+#                         # Build pmf/CDF for this bucket (truncated Gaussian + ESC)
+#                         pmf, tail, Qmax, L = _disc_gauss_pmf(mu0_y[mask], sig_y_flat[mask], q)
+#                         cdf = _pmf_to_cdf_with_escape(pmf, tail)  # [Nmask, 2*qv+3]
+#                         # Map symbols → indices: [-q..q]→[0..2q], ESC→2q+1
+#                         v = y_flat[mask].to(torch.int32)
+#                         idx = v.clamp(-qv, qv) + qv
+#                         esc = (v.abs() > qv)
+#                         idx[esc] = 2*qv + 1  # ESC position
+#                         # Encode pmf-part
+#                         bits_bucket = _encode_bucket_torchac(idx, cdf)
+#                         if bits_bucket is None: bits_bucket = 0.0
+#                         bits_y_total += float(bits_bucket)
+#                         # Add residual cost for ESC (simple Rice count; not actually coded here)
+#                         if esc.any():
+#                             k = 2  # choose a small Rice parameter
+#                             r = (v.abs() - qv)[esc].to(torch.int64)   # unsigned residual
+#                             # +1 sign bit per escape
+#                             bits_res = sum(_rice_len(int(n.item()), k) + 1 for n in r)
+#                             bits_y_total += bits_res
+
+#                     # Same for z (often Qz is constant; you can do a single bucket)
+#                     bits_z_total = 0.0
+#                     for q in torch.unique(Qz_flat):
+#                         mask = (Qz_flat == q)
+#                         if not mask.any(): continue
+#                         qv = int(q.item())
+#                         pmf, tail, Qmax, L = _disc_gauss_pmf(mu0_z[mask], torch.ones_like(mu0_z[mask]), q)
+#                         cdf = _pmf_to_cdf_with_escape(pmf, tail)
+#                         v = z_flat[mask].to(torch.int32)
+#                         idx = v.clamp(-qv, qv) + qv
+#                         esc = (v.abs() > qv)
+#                         idx[esc] = 2*qv + 1
+#                         bits_bucket = _encode_bucket_torchac(idx, cdf)
+#                         if bits_bucket is None: bits_bucket = 0.0
+#                         bits_z_total += float(bits_bucket)
+#                         if esc.any():
+#                             k = 2
+#                             r = (v.abs() - qv)[esc].to(torch.int64)
+#                             bits_res = sum(_rice_len(int(n.item()), k) + 1 for n in r)
+#                             bits_z_total += bits_res
+
+#                     val_bits = {"bits_y": bits_y_total, "bits_z": bits_z_total,
+#                             "bits_total": bits_y_total + bits_z_total}
+#             return logits, rate_loss, route_probs_rx, val_bits
+
+
+class MODJSCC_MoE_Faithful(nn.Module):
+    """
+    Clean forward:
+      - Hard modulation (top-1 ST) for the channel path
+      - Hard airtime Ns (discrete modes via ST)
+      - Entropy model returns per-sample rate_bits (for training)
+      - Eval helper returns true bitcounts (val_bits) when needed
+    """
+    def __init__(self, d_model=256, freeze_bert=False,
+                 N_s_base=64, N_z=8,
+                 M_list=[64]#, 8, 16, 32, 64, 128)
+                 , M_z=2,
+                 ns_modes=(0.1, 0.25, 0.5, 0.75, 1.0, 1.25),
+                 force_expert: int=None):
         super().__init__()
         self.d_model = d_model
-        self.N_s = N_s
+        self.N_s_base = N_s_base #starting point for Ns
         self.N_z = N_z
-        self.M_list = M_list
-        self.bps_list = [int(math.log2(M)) for M in M_list]
-        self.K = len(M_list)
+        self.M_list = list(M_list)
+        self.bps_list = [int(math.log2(M)) for M in self.M_list]
+        self.K = len(self.M_list)
+        self.force_expert = force_expert
         self.M_z = M_z
         self.bps_z = int(math.log2(M_z))
+        self.ns_modes = torch.tensor(ns_modes, dtype=torch.float32)  # e.g., [0.5,1,1.5,2]
 
-        # Semantic encoder
+        # ----- Semantic encoder / decoder -----
         self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
+        self.decoder = nn.Sequential(nn.Linear(2*d_model, 256), nn.ReLU(),
+                                     nn.Linear(256, 2))
 
-        # Hyperprior MLPs
-        self.hyper_encoder = nn.Sequential(
-            nn.Linear(d_model + 1, 128), nn.ReLU(), nn.Linear(128, d_model)
-        )
-        self.hyper_decoder = nn.Sequential(
-            nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128,  d_model + self.K)
-        )
+        # ----- Hyperprior (entropy model) -----
+        self.hyper_encoder = nn.Sequential(nn.Linear(d_model + 1, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
+        self.hyper_decoder = nn.Sequential(nn.Linear(d_model, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
 
-        # Side-channel and main-channel encoders/decoders
-        self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)
-        self.hyper_channel_decoder = nn.Linear(N_z * 2, d_model)
-        self.channel_encoders = nn.ModuleList([
-            nn.Linear(d_model, N_s * bps) for bps in self.bps_list
-        ])
-        self.channel_decoders = nn.ModuleList([
-            nn.Linear(2 * N_s, d_model) for _ in self.bps_list
-        ])
-        # self.channel_encoders = nn.ModuleList([
-        #                         nn.Sequential(
-        #                             nn.Linear(d_model, 2 * d_model),
-        #                             nn.ReLU(),
-        #                             nn.Linear(2 * d_model, N_s * bps),
-        #                         ) for bps in self.bps_list])
-        # self.channel_decoders = nn.ModuleList([
-        #                         nn.Sequential(    nn.Linear(2 * N_s, 2 * d_model),    nn.ReLU(),    nn.Linear(2 * d_model, d_model),)   for _ in self.bps_list        ])
+        # Side-channel mapper (z)
+        self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)   # bits
+        self.hyper_channel_decoder = nn.Linear(2 * N_z, d_model)            # from IQ symbols
 
-        # Decoder now takes both feat and sigma_rec (2*d_model)
-        self.decoder = nn.Sequential(
-            nn.Linear(2 * d_model, 256), nn.ReLU(), nn.Linear(256, 2)
-        )
+        # Main-channel per-expert bit mappers and decoders
+        self.channel_encoders = nn.ModuleList([nn.Linear(d_model, N_s_base * bps)
+                                               for bps in self.bps_list])
+        self.channel_decoders = nn.ModuleList([nn.Linear(2 * N_s_base, d_model)
+                                               for _ in self.bps_list])
 
-    def forward(self, input_ids, attention_mask, n_var, channel):
-        # if self.training:
-            B = input_ids.size(0)
-            device = input_ids.device
-            chan = Channels()
+        # ----- Router heads -----
+        # feature: [logSNR, mean|z|, mean logσ+, var logσ+]
+        self.router = SemanticRouter(d_in=4, n_experts=self.K)  # returns (onehot, probs)
+        self.ns_head = nn.Sequential(nn.Linear(4, 64), nn.ReLU(),
+                                     nn.Linear(64, len(ns_modes)))  # logits for Ns modes
 
-            # 1) Encode x -> y
-            y = self.encoder(input_ids, attention_mask)
-            assert not torch.isnan(y).any(), "NaN in encoder output y"
+    # --------- utilities ---------
+    @staticmethod
+    def _router_feat(snr_feat, z_like, sigma_like):
+        B = snr_feat.size(0)
+        mean_abs_z = z_like.abs().mean(dim=1, keepdim=True)
+        logsig = torch.log1p(F.softplus(sigma_like).abs() + 1e-6)
+        mu_logsig = logsig.mean(dim=1, keepdim=True)
+        var_logsig = logsig.var(dim=1, unbiased=False, keepdim=True)
+        return torch.cat([snr_feat, mean_abs_z, mu_logsig, var_logsig], dim=1)  # [B,4]
 
-            # 2) Hyperprior z from y and SNR
-            snr_feat = torch.log(1.0 / n_var).view(-1, 1) if torch.is_tensor(n_var) else \
-                    torch.full((B,1), math.log(1.0/n_var), device=device)
-            z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
-            assert not torch.isnan(z).any(), "NaN in hyper_encoder output z"
+    @staticmethod
+    def _norm_used_then_pad(y_syms, k):
+        # y_syms: [Ns_base, 2]; k may be out of range -> clamp
+        Ns = y_syms.size(0)
+        k = max(1, min(int(k), Ns))
+        used = y_syms[:k]
+        used = used / (used.pow(2).mean().sqrt() + 1e-9)
+        if k == Ns:
+            return used  # no pad needed
+        pad = torch.zeros(Ns - k, y_syms.size(1), device=y_syms.device, dtype=y_syms.dtype)
+        return torch.cat([used, pad], dim=0)
 
-            # 3) Quantize z
-            z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else z.round()
-
-            # 4) Determine modulation probs from hyper_decoder
-            hyper_out = self.hyper_decoder(z_tilde)
-            _, mod_logits = torch.split(hyper_out, [ self.d_model, self.K], dim=1)
-            
-            mod_probs = F.gumbel_softmax(mod_logits, tau=1.0, hard=False)
-            assert not torch.isnan(mod_probs).any(), "NaN in mod_probs"
-
-            # 5) Quantize y
-            y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else y.round()
-
-            # 6) Side-channel: encode z to bits->symbols
-            z_bits = self.hyper_channel_encoder(z_tilde)
-            assert not torch.isnan(z_bits).any(), "NaN in z_bits logits"
-            
-            # z_bits = gumbel_sigmoid(z_bits, τ=1.0, hard=False).clamp(-10,10)
-            z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)
-            # if torch.isnan(z_syms).any():
-            #     print("Found NaN in z_syms:", z_syms[z_syms.isnan()])
-            z_syms = torch.nan_to_num(z_syms, nan=0.0, posinf=0.0, neginf=0.0)
-            assert not torch.isnan(z_syms).any(), "NaN in z_syms"
-            
-            z_flat = z_syms.view(B, -1)
-            # z_flat = z_tilde
-            # 7) Main-channel: encode y to K symbol streams
-            Tx_y_list = []
-            for i, bps in enumerate(self.bps_list):
-                bits_y = self.channel_encoders[i](y_tilde)
-                bits_y = gumbel_sigmoid(bits_y, τ=1.0, hard=False)
-                syms_y = map_to_constellation(bits_y.view(B, self.N_s, bps), self.M_list[i])
-                Tx_y_list.append(syms_y.view(B, -1))
-            Tx_y = torch.stack(Tx_y_list, dim=-1).mul(mod_probs.unsqueeze(1)).sum(-1)
-            assert not torch.isnan(Tx_y).any(), "NaN in Tx_y mixture"
-
-            # 8) Transmit concatenated symbols
-            Tx = PowerNormalize(torch.cat([z_flat, Tx_y], dim=1))
-            assert not torch.isnan(Tx).any(), "NaN in Tx"
-            channels = Channels()
-            if channel == 'AWGN':
-                Rx = channels.AWGN(Tx, n_var)
-            elif channel == 'Rayleigh':
-                Rx = channels.Rayleigh(Tx, n_var)
-            elif channel == 'Rician':
-                Rx = channels.Rician(Tx, n_var)
-            else:
-                raise ValueError("Invalid channel type")
-            # Rx = channel(Tx, n_var)#channels.AWGN(Tx, n_var)
-            assert not torch.isnan(Rx).any(), "NaN in Rx"
-
-            # 9) Split received into z_rx and y_rx
-            y_dim = self.N_s * 2
-            total_dim = Rx.size(1)
-            split_at = total_dim - y_dim
-            assert y_dim == self.channel_decoders[0].in_features, f"Channel decoder expects input dim {self.channel_decoders[0].in_features}, but y_dim computed as {y_dim}"
-            z_rx = Rx[:, :split_at]
-            y_rx = Rx[:, split_at:]
-
-            # 10) Decode hyperprior from z_rx
-            z_hat = self.hyper_channel_decoder(z_rx)
-            hyper_out_rec = self.hyper_decoder(z_hat)
-            raw_sigma_rec, mod_logits_rec = torch.split(
-                hyper_out_rec, [self.d_model, self.K], dim=1
-            )
-            sigma_rec = F.softplus(raw_sigma_rec) + 1e-6
-            mod_probs_rec = F.gumbel_softmax(mod_logits_rec, tau=1.0, hard=False)
-            assert not torch.isnan(sigma_rec).any(), "NaN in sigma_rec"
-            assert not torch.isnan(mod_probs_rec).any(), "NaN in mod_probs_rec"
-
-            # 11) Decode main-channel and mix
-            decs = [dec(y_rx) for dec in self.channel_decoders]
-            feat = torch.stack(decs, dim=-1).mul(mod_probs_rec.unsqueeze(1)).sum(-1)
-            assert not torch.isnan(feat).any(), "NaN in feat"
-
-            # 12) Classification conditioned on sigma
-            feat_cat = torch.cat([feat, sigma_rec], dim=1)
-            logits = self.decoder(feat_cat)
-            # if torch.isnan(logits).any():
-            #     raise ValueError(f"NaN detected in logits; feat_cat stats: min={feat_cat.min()}, max={feat_cat.max()}, mean={feat_cat.mean()}")
-
-            # 13) Rate-loss
-            p_y = discrete_probability(y_tilde, torch.zeros_like(y_tilde), sigma_rec)
-            rate_y = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
-            p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
-            rate_z = -torch.log2(p_z + 1e-9).sum(dim=1).mean()
-            rate_loss = rate_y + rate_z
-
-            return logits, rate_loss, mod_probs_rec
-        # else:
-        #     bitstreams_z, bitstreams_y = self.encode_bits(input_ids, attention_mask, n_var)
-        #     logits, rate_loss = self.decode_bits(bitstreams_z, bitstreams_y, n_var)
-        #     return logits, rate_loss
-
-    def encode_bits(self, input_ids, attention_mask, n_var):
-        """Quantize and entropy-encode z and y into bitstreams."""
-        B = input_ids.size(0)
-        device = input_ids.device
-
-        # 1) Semantic + hyperprior
-        y = self.encoder(input_ids, attention_mask)                             # [B, d_model]
-        snr_feat = (torch.log(1.0 / n_var).view(-1, 1)
-                    if torch.is_tensor(n_var)
-                    else torch.full((B, 1), math.log(1.0/n_var), device=device))
-        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))                 # [B, d_model]
-
-        # 2) Hard quantize
-        z_tilde = torch.round(z)                                                 # [B, d_model]
-        hyper_out = self.hyper_decoder(z_tilde)
-        raw_sigma, _ = torch.split(hyper_out, [self.d_model, self.K], dim=1)
-        sigma = F.softplus(raw_sigma) + 1e-6                                     # [B, d_model]
-        y_tilde = torch.round(y)                                                 # [B, d_model]
-
-        # 3) Build integer symbols
-        z_symbols = z_tilde.long()                                               # [B, d_model]
-        y_symbols = y_tilde.long()                                               # [B, d_model]
-
-        # 4) Compute PMFs via CDF differencing (same as before)
-        def compute_pmf(symbols, mu_, sigma_):
-            """
-            symbols:  LongTensor [B, L] of integer bins
-            mu_:      float or FloatTensor [B] or [B, L]
-            sigma_:   FloatTensor [B, L]
-            returns:  FloatTensor [B, L, C]
-            """
-            B, L = symbols.shape
-            device = symbols.device
-
-            # 1) Make mu a [B, L] tensor
-            if not torch.is_tensor(mu_):
-                mu = torch.zeros(B, L, device=device)
-            else:
-                mu = mu_
-                if mu.ndim == 1:
-                    mu = mu.view(B, 1).expand(B, L)
-                elif mu.shape != (B, L):
-                    mu = mu.expand(B, L)
-
-            # 2) Ensure sigma_ is [B, L]
-            sigma = sigma_
-            if sigma.ndim == 1:
-                sigma = sigma.view(B, 1).expand(B, L)
-
-            # 3) Support edges from -m-0.5 to +m+0.5
-            m = int(symbols.abs().max().item())
-            edges = torch.arange(-m - 0.5, m + 0.5 + 1e-6, device=device)  # length C+1
-
-            # 4) Build Normal with batch_shape=[B,L]
-            dist = torch.distributions.Normal(
-                mu.unsqueeze(-1),     # [B, L, 1]
-                sigma.unsqueeze(-1)   # [B, L, 1]
-            )
-
-            # 5) Expand edges to [B, L, C+1], compute CDF
-            edges_exp = edges.view(1, 1, -1).expand(B, L, -1)  # [B, L, C+1]
-            cdf = dist.cdf(edges_exp)                          # [B, L, C+1]
-
-            # 6) PMF by differencing: [B, L, C]
-            pmf = (cdf[..., 1:] - cdf[..., :-1]).clamp(min=1e-9)
-            return pmf
-
-
-        pmf_z = compute_pmf(z_symbols.float(),
-                            torch.zeros_like(z), torch.ones_like(z))             # [B, d_model, Cz]
-        pmf_y = compute_pmf(y_symbols.float(), 0, sigma)                        # [B, d_model, Cy]
-
-        # 5) Entropy-encode each sample with file-based RangeEncoder
-        bitstreams_z, bitstreams_y = [], []
-        base_dir = "/home/necphy/ducjunior/BERT_Backdoor"
-        os.makedirs(base_dir, exist_ok=True)
-
-        for i in range(B):
-            # --- z stream ---
-            z_path = os.path.join(base_dir, f"z_bits_{i}.bin")
-            # convert PMF to integer CDF table
-            prob_z = pmf_z[i][0].cpu().tolist()  # flatten to 1D list length Cz
-            cdf_z = prob_to_cum_freq(prob_z, resolution=1 << 16)
-            enc_z = RangeEncoder(z_path)
-            enc_z.encode(z_symbols[i].cpu().tolist(), cdf_z)
-            enc_z.close()
-            with open(z_path, "rb") as f:
-                bitstreams_z.append(f.read())
-
-            # --- y stream ---
-            y_path = os.path.join(base_dir, f"y_bits_{i}.bin")
-            prob_y = pmf_y[i][0].cpu().tolist()  # flatten to 1D list length Cy
-            cdf_y = prob_to_cum_freq(prob_y, resolution=1 << 16)
-            enc_y = RangeEncoder(y_path)
-            enc_y.encode(y_symbols[i].cpu().tolist(), cdf_y)
-            enc_y.close()
-            with open(y_path, "rb") as f:
-                bitstreams_y.append(f.read())
-
-        return bitstreams_z, bitstreams_y
-
-      
-
-    def decode_bits(self, bitstreams_z, bitstreams_y, n_var):
-                """Entropy-decode bitstreams (file-based) and classify."""
-                B = len(bitstreams_z)
-                device = next(self.parameters()).device
-
-                # preallocate symbol buffers
-                z_symbols = torch.zeros(B, self.d_model, dtype=torch.long, device=device)
-                y_symbols = torch.zeros(B, self.d_model, dtype=torch.long, device=device)
-
-                base_dir = "/home/necphy/ducjunior/BERT_Backdoor"
-                os.makedirs(base_dir, exist_ok=True)
-
-                def compute_pmf(symbols, mu_, sigma_):
-                    """
-                    symbols:  LongTensor [B, L] of integer bins
-                    mu_:      float or FloatTensor [B] or [B, L]
-                    sigma_:   FloatTensor [B, L]
-                    returns:  FloatTensor [B, L, C]
-                    """
-                    B, L = symbols.shape
-                    device = symbols.device
-
-                    # 1) Make mu a [B, L] tensor
-                    if not torch.is_tensor(mu_):
-                        mu = torch.zeros(B, L, device=device)
-                    else:
-                        mu = mu_
-                        if mu.ndim == 1:
-                            mu = mu.view(B, 1).expand(B, L)
-                        elif mu.shape != (B, L):
-                            mu = mu.expand(B, L)
-
-                    # 2) Ensure sigma_ is [B, L]
-                    sigma = sigma_
-                    if sigma.ndim == 1:
-                        sigma = sigma.view(B, 1).expand(B, L)
-
-                    # 3) Support edges from -m-0.5 to +m+0.5
-                    m = int(symbols.abs().max().item())
-                    edges = torch.arange(-m - 0.5, m + 0.5 + 1e-6, device=device)  # length C+1
-
-                    # 4) Build Normal with batch_shape=[B,L]
-                    dist = torch.distributions.Normal(
-                        mu.unsqueeze(-1),     # [B, L, 1]
-                        sigma.unsqueeze(-1)   # [B, L, 1]
-                    )
-
-                    # 5) Expand edges to [B, L, C+1], compute CDF
-                    edges_exp = edges.view(1, 1, -1).expand(B, L, -1)  # [B, L, C+1]
-                    cdf = dist.cdf(edges_exp)                          # [B, L, C+1]
-
-                    # 6) PMF by differencing: [B, L, C]
-                    pmf = (cdf[..., 1:] - cdf[..., :-1]).clamp(min=1e-9)
-                    return pmf
-
-                for i in range(B):
-                    # --- decode z ---
-                    z_path = os.path.join(base_dir, f"z_bits_{i}.bin")
-                    # reconstruct the same PMF we used in encoding
-                    dummy = torch.zeros(1, self.d_model, device=device)
-                    pmf_z = compute_pmf(dummy,
-                                        torch.zeros_like(dummy),
-                                        torch.ones_like(dummy))[0]  # [L, Cz]
-                    prob_z = pmf_z[0].cpu().tolist()
-                    cdf_z  = prob_to_cum_freq(prob_z, resolution=1<<16)
-
-                    dec_z = RangeDecoder(z_path)
-                    z_list = dec_z.decode(self.d_model, cdf_z)   # length=self.d_model
-                    dec_z.close()
-                    z_symbols[i] = torch.tensor(z_list, device=device)
-
-                    # --- get mu_rec and sigma_rec from hyper_decoder(z_tilde) ---
-                    hyper_out_rec = self.hyper_decoder(
-                        z_symbols[i].float().view(1, -1)
-                    )
-                    raw_sigma_rec, _ = torch.split(
-                        hyper_out_rec,
-                        [self.d_model, self.K],
-                        dim=1
-                    )
-                    sigma_rec = F.softplus(raw_sigma_rec) + 1e-6  # [1, d_model]
-
-                    # --- decode y ---
-                    y_path = os.path.join(base_dir, f"y_bits_{i}.bin")
-                    # use dummy for shape, mu_rec for center, sigma_rec for scale
-                    pmf_y = compute_pmf(dummy, 0, sigma_rec)[0]  # [L, Cy]
-                    prob_y = pmf_y[0].cpu().tolist()
-                    cdf_y  = prob_to_cum_freq(prob_y, resolution=1<<16)
-
-                    dec_y = RangeDecoder(y_path)
-                    y_list = dec_y.decode(self.d_model, cdf_y)
-                    dec_y.close()
-                    y_symbols[i] = torch.tensor(y_list, device=device)
-
-                # finally, convert symbols → logits, rate_loss
-                logits, rate_loss = self._decode_from_symbols(
-                    z_symbols, y_symbols, n_var
-                )
-                return logits, rate_loss
-
-    def _decode_from_symbols(self, z_symbols, y_symbols, n_var):
-        B = z_symbols.size(0)
-        device = z_symbols.device
+    def forward(self, input_ids, attention_mask, n_var, channel='AWGN', return_probs=False):
+        """
+        Returns:
+          logits: [B, C]
+          rate_bits: [B] (entropy-model proxy)
+          route_sel: [B, K] hard one-hot for modulation
+          Ns_eff:  [B] int #symbols used (per sample)
+          (optionally) route_probs, ns_probs for logging
+        """
+        B, device = input_ids.size(0), input_ids.device
         chan = Channels()
-        # z_symbols -> continuous z_flat
-        z_flat = z_symbols.float().view(B, -1)
-        # Decode hyperprior directly
-        hyper_out = self.hyper_decoder(z_flat)
-        raw_sigma_rec, mod_logits_rec = torch.split(
-            hyper_out, [  self.d_model, self.K], dim=1)
-        sigma_rec = F.softplus(raw_sigma_rec) + 1e-6
-        mod_probs_rec = F.gumbel_softmax(mod_logits_rec, tau=1.0, hard=False)
-        # Map y_symbols -> Tx_y
-        y_flat = y_symbols.float()
-        Tx_y_list = []
-        for i, bps in enumerate(self.bps_list):
-            bits_logits = self.channel_encoders[i](y_flat)
-            bits_rs = torch.sigmoid(bits_logits).view(B, self.N_s, bps)
-            syms = map_to_constellation(bits_rs, self.M_list[i])
-            Tx_y_list.append(syms.view(B, -1))
-        Tx_y = torch.stack(Tx_y_list, dim=-1).mul(mod_probs_rec.unsqueeze(1)).sum(-1)
-        # Transmit z_flat + Tx_y
-        Tx = torch.cat([z_flat, Tx_y], dim=1)
-        Rx = chan.AWGN(Tx, n_var)
-        # split at d_model
-        z_rx = Rx[:, :self.d_model]
-        y_rx = Rx[:, self.d_model:]
-        # decode main-channel
-        decs = [dec(y_rx) for dec in self.channel_decoders]
-        feat = torch.stack(decs, dim=-1).mul(mod_probs_rec.unsqueeze(1)).sum(-1)
-        feat_cat = torch.cat([feat, sigma_rec], dim=1)
-        logits = self.decoder(feat_cat)
-        # rate loss
-        p_y = discrete_probability(y_symbols.float(), torch.zeros_like(y_symbols), sigma_rec)
-        rate_y = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
-        p_z = discrete_probability(z_symbols.float(), torch.zeros_like(z_flat), torch.ones_like(z_flat))
-        rate_z = -torch.log2(p_z + 1e-9).sum(dim=1).mean()
-        return logits, rate_y + rate_z
 
-
-
-class SimpleMODJSCC_WithHyper(nn.Module):
-    def __init__(self, d_model=256, freeze_bert=False, N_s=64):
-        super().__init__()
-        self.N_s = N_s
-        self.d_model = d_model
-
-        self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
-        self.channel_enc = nn.Linear(d_model, 2 * N_s)
-        self.channel_dec = nn.Linear(2 * N_s, d_model)
-
-        self.decoder = nn.Sequential(
-            nn.Linear(d_model, 256),
-            nn.ReLU(),
-            nn.Linear(256, 2)
-        )
-
-        # === Hyper encoder + decoder ===
-        self.hyper_encoder = nn.Sequential(
-            nn.Linear(d_model + 1, 128),
-            nn.ReLU(),
-            nn.Linear(128, d_model)
-        )
-        self.hyper_decoder = nn.Sequential(
-            nn.Linear(d_model, 128),
-            nn.ReLU(),
-            nn.Linear(128, 2 * d_model)
-        )
-
-    def forward(self, input_ids, attention_mask, n_var):
-        B = input_ids.size(0)
-        device = input_ids.device
-        channels = Channels()
-
-        # === 1. Semantic encoder ===
+        # 1) semantic Roberta encoder
         y = self.encoder(input_ids, attention_mask)  # [B, d_model]
 
-        # === 2. Hyperprior to model y ===
-        snr_feat = torch.log(1.0 / n_var).unsqueeze(1)  # [B, 1]
-        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))  # [B, d_model]
-
-        if self.training:
-            z_tilde = z + torch.rand_like(z) - 0.5
-        else:
-            z_tilde = torch.round(z)
-
-        mu_sigma = self.hyper_decoder(z_tilde)  # [B, 2*d_model]
-        mu, raw_sigma = mu_sigma[:, :self.d_model], mu_sigma[:, self.d_model:]
+        # 2) hyperprior (use SNR)
+        snr_feat = torch.log(1.0/n_var).view(-1,1) if torch.is_tensor(n_var) \
+                   else torch.full((B,1), math.log(1.0/n_var), device=device)
+        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
+        z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else z.round()
+        raw_sigma = self.hyper_decoder(z_tilde)
         sigma = F.softplus(raw_sigma) + 1e-6
 
-        # === 3. Quantize y ===
-        if self.training:
-            y_tilde = y + torch.rand_like(y) - 0.5
+        # 3) router features
+        feat = self._router_feat(snr_feat, z_tilde, raw_sigma)
+
+        # 3a) modulation (hard one-hot, straight-through)
+        route_hard_tx, route_probs_tx = self.router(feat, hard=True)
+        if self.force_expert is not None:
+            route_hard_tx = F.one_hot(torch.full((B,), self.force_expert, device=device),
+                                      num_classes=self.K).float()
+            route_probs_tx = route_hard_tx
+
+        # 3b) airtime Ns (hard one-hot via Gumbel; reuse feat)
+        ns_logits = self.ns_head(feat)
+        ns_onehot = F.gumbel_softmax(ns_logits, tau=1.0, hard=True)  # [B, |modes|]
+        Ns_eff = (ns_onehot @ self.ns_modes.to(device)).mul(self.N_s_base).long()  # [B] get the real Ns for each sample
+        Ns_eff = Ns_eff.clamp(min=1, max=self.N_s_base)
+        # 4) quantize y (noise in train)
+        y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else y.round()
+
+        # 5) side-channel z → symbols
+        z_bits = self.hyper_channel_encoder(z_tilde)                         # [B, N_z*bps_z]
+        z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)  # [B,N_z,2] #z fix symbols size
+        z_flat = z_syms.view(B, -1)                                          # [B, 2*N_z]
+        # normalize z separately (optional but clean)
+        z_flat = z_flat / (z_flat.pow(2).mean(dim=1, keepdim=True).sqrt() + 1e-9)
+
+        # 6) main-channel: build per-expert symbols once, then select
+        syms_list = []
+        for i, bps in enumerate(self.bps_list):
+            bits = self.channel_encoders[i](y_tilde)                         # [B, N_s_base*bps]
+            bits = gumbel_sigmoid(bits, τ=1.0, hard=self.training)
+            syms = map_to_constellation(bits.view(B, self.N_s_base, bps), self.M_list[i])  # [B,Ns,2]
+            syms_list.append(syms)
+        Sy = torch.stack(syms_list, dim=-1)                                  # [B, Ns, 2, K]
+        Sy_sel = (Sy * route_hard_tx.view(B, 1, 1, self.K)).sum(dim=-1)      # [B, Ns, 2]
+
+        # 6a) apply Ns mask + per-sample normalization on used part
+        out_syms = []
+        for b in range(B):
+            k = max(1, int(Ns_eff[b].item()))
+            out_syms.append(self._norm_used_then_pad(Sy_sel[b], k))
+        Sy_masked = torch.stack(out_syms, dim=0)                              # [B, Ns, 2]
+
+        # 7) channel
+        Tx = torch.cat([z_flat, Sy_masked.view(B, -1)], dim=1)                # [B, 2*N_z + 2*Ns_base]
+        if channel == 'AWGN':
+            Rx = chan.AWGN(Tx, n_var)
+        elif channel == 'Rayleigh':
+            Rx = chan.Rayleigh(Tx, n_var)
         else:
-            y_tilde = torch.round(y)
+            Rx = chan.Rician(Tx, n_var)
 
-        # === 4. Rate loss ===
-        p_y = discrete_probability(y_tilde, mu, sigma)
-        rate_loss = -torch.log2(p_y + 1e-9).sum(dim=1).mean()
+        # 8) split + decode (use selected expert only)
+        y_dim = 2 * self.N_s_base
+        z_rx, y_rx = Rx[:, :-y_dim], Rx[:, -y_dim:]
+        z_hat = self.hyper_channel_decoder(z_rx)
+        sigma_rec = F.softplus(self.hyper_decoder(z_hat)) + 1e-6
 
-        # === 5. Channel simulation ===
-        Tx = PowerNormalize(self.channel_enc(y_tilde))  # [B, 2*N_s]
-        Rx = channels.AWGN(Tx, n_var)
+        # recompute router at RX (deterministic) if you want—here we reuse TX
+        dec_all = torch.stack([dec(y_rx) for dec in self.channel_decoders], dim=-1)  # [B,d_model,K]
+        feat_y = (dec_all * route_hard_tx.view(B, 1, self.K)).sum(dim=-1)            # [B, d_model]
 
-        # === 6. Channel decoding & classification ===
-        feat = self.channel_dec(Rx)  # [B, d_model]
-        logits = self.decoder(feat)
+        logits = self.decoder(torch.cat([feat_y, sigma_rec], dim=1))                 # [B, C]
 
-        return logits, rate_loss
+        # 9) entropy-model rate (per-sample)
+        p_y = discrete_probability(y_tilde, torch.zeros_like(y_tilde), sigma_rec)
+        p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
+        bits_y = -torch.log2(p_y + 1e-9).sum(dim=1)      # [B]
+        bits_z = -torch.log2(p_z + 1e-9).sum(dim=1)      # [B]
+        rate_bits = bits_y + bits_z
 
-    
-    
-    
-    
+        if return_probs:
+            return logits, rate_bits, route_hard_tx, Ns_eff, route_probs_tx, F.softmax(ns_logits, -1)
+        else:
+            return logits, rate_bits, route_hard_tx, Ns_eff
+
+    # --------- faithful true bitcount (eval helper) --------
+    @torch.no_grad()
+    def true_bitcounts(self, input_ids, attention_mask, n_var):
+        """
+        Returns numeric means only (never NaN):
+        {"bits_y_mean": float, "bits_z_mean": float, "bits_total_mean": float}
+        Requires your helpers:
+        _adaptive_Q_from_sigma, _disc_gauss_pmf, _pmf_to_cdf_with_escape, _encode_bucket_torchac, _rice_len
+        """
+        import math
+        self.eval()
+        B = input_ids.size(0)
+        if B == 0:
+            return {"bits_y_mean": 0.0, "bits_z_mean": 0.0, "bits_total_mean": 0.0}
+
+        device = input_ids.device
+        eps = 1e-6
+
+        # --- analysis & hyperprior (eval path: rounding) ---
+        y = self.encoder(input_ids, attention_mask)                                  # [B, D]
+        snr_feat = (torch.log(1.0 / n_var).view(-1, 1) if torch.is_tensor(n_var)
+                    else torch.full((B, 1), math.log(1.0 / n_var), device=device))
+        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))                      # [B, D]
+        raw_sigma = self.hyper_decoder(z)                                            # [B, D]
+        sigma_y = F.softplus(raw_sigma) + 1e-6                                       # [B, D]
+        sigma_y = torch.clamp(sigma_y, min=1e-6, max=1e6)                            # safety
+
+        y_int = y.round().to(torch.int32)                                            # [B, D]
+        z_int = z.round().to(torch.int32)                                            # [B, D]
+        Qy = _adaptive_Q_from_sigma(sigma_y, eps).view(B, -1)                        # [B, D]
+        Qz = _adaptive_Q_from_sigma(torch.ones_like(z), eps).view(B, -1)             # [B, D]
+
+        def _safe_num(x, default=0.0):
+            try:
+                v = float(x)
+            except Exception:
+                return default
+            return v if math.isfinite(v) else default
+
+        sum_y = 0.0
+        sum_z = 0.0
+
+        for b in range(B):
+            # ---- Y path ----
+            y_b   = y_int[b].view(-1)
+            sig_b = sigma_y[b].view(-1)
+            Qy_b  = Qy[b]
+
+            bits_y_b = 0.0
+            uniq_Qy = torch.unique(Qy_b)
+            if uniq_Qy.numel() == 0:
+                uniq_Qy = torch.tensor([1], device=Qy_b.device)  # fallback
+
+            for q in uniq_Qy:
+                mask = (Qy_b == q)
+                if not mask.any():
+                    continue
+                qv = max(1, int(_safe_num(q.item(), 1)))
+
+                # pmf/cdf (sanitize NaNs/Infs)
+                pmf, tail, _, _ = _disc_gauss_pmf(torch.zeros_like(sig_b[mask]),
+                                                sig_b[mask], q)
+                if isinstance(pmf, torch.Tensor):
+                    pmf = torch.nan_to_num(pmf, nan=0.0, posinf=0.0, neginf=0.0)
+                    tail = torch.nan_to_num(tail, nan=0.0, posinf=0.0, neginf=0.0)
+                cdf = _pmf_to_cdf_with_escape(pmf, tail)
+                if isinstance(cdf, torch.Tensor):
+                    cdf = torch.nan_to_num(cdf, nan=0.0, posinf=0.0, neginf=0.0)
+
+                v   = y_b[mask].to(torch.int32)
+                idx = v.clamp(-qv, qv) + qv
+                esc = (v.abs() > qv)
+                idx[esc] = 2*qv + 1
+
+                bits_bucket = _encode_bucket_torchac(idx, cdf)
+                bits_y_b += _safe_num(0.0 if bits_bucket is None else bits_bucket)
+
+                if esc.any():
+                    k_rice = 2
+                    r = (v.abs() - qv)[esc].to(torch.int64)
+                    # +1 sign bit per escape
+                    bits_res = 0
+                    for n in r:
+                        try:
+                            bits_res += _rice_len(int(n.item()), k_rice) + 1
+                        except Exception:
+                            bits_res += 0
+                    bits_y_b += bits_res
+
+            # ---- Z path ----
+            z_b  = z_int[b].view(-1)
+            Qz_b = Qz[b]
+            bits_z_b = 0.0
+            uniq_Qz = torch.unique(Qz_b)
+            if uniq_Qz.numel() == 0:
+                uniq_Qz = torch.tensor([1], device=Qz_b.device)
+
+            for q in uniq_Qz:
+                mask = (Qz_b == q)
+                if not mask.any():
+                    continue
+                qv = max(1, int(_safe_num(q.item(), 1)))
+
+                pmf, tail, _, _ = _disc_gauss_pmf(torch.zeros_like(z_b[mask], dtype=torch.float32),
+                                                torch.ones_like(z_b[mask], dtype=torch.float32), q)
+                if isinstance(pmf, torch.Tensor):
+                    pmf = torch.nan_to_num(pmf, nan=0.0, posinf=0.0, neginf=0.0)
+                    tail = torch.nan_to_num(tail, nan=0.0, posinf=0.0, neginf=0.0)
+                cdf = _pmf_to_cdf_with_escape(pmf, tail)
+                if isinstance(cdf, torch.Tensor):
+                    cdf = torch.nan_to_num(cdf, nan=0.0, posinf=0.0, neginf=0.0)
+
+                v   = z_b[mask].to(torch.int32)
+                idx = v.clamp(-qv, qv) + qv
+                esc = (v.abs() > qv)
+                idx[esc] = 2*qv + 1
+
+                bits_bucket = _encode_bucket_torchac(idx, cdf)
+                bits_z_b += _safe_num(0.0 if bits_bucket is None else bits_bucket)
+
+                if esc.any():
+                    k_rice = 2
+                    r = (v.abs() - qv)[esc].to(torch.int64)
+                    bits_res = 0
+                    for n in r:
+                        try:
+                            bits_res += _rice_len(int(n.item()), k_rice) + 1
+                        except Exception:
+                            bits_res += 0
+                    bits_z_b += bits_res
+
+            # finalize per-sample (guard)
+            bits_y_b = _safe_num(bits_y_b, 0.0)
+            bits_z_b = _safe_num(bits_z_b, 0.0)
+            sum_y += bits_y_b
+            sum_z += bits_z_b
+
+        denom = float(B)
+        bits_y_mean     = _safe_num(sum_y / denom, 0.0)
+        bits_z_mean     = _safe_num(sum_z / denom, 0.0)
+        bits_total_mean = _safe_num((sum_y + sum_z) / denom, 0.0)
+        return {
+            "bits_y_mean": bits_y_mean,
+            "bits_z_mean": bits_z_mean,
+            "bits_total_mean": bits_total_mean,
+        }
+
+import math, torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import math, torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MODJSCC_MoE_Faithful_2(nn.Module):
+    """
+    Time-unrolled PHY:
+      - One modulation per mini-frame (T_max frames per burst)
+      - Per-frame expert routing (hard, ST) and stay/switch head
+      - Per-expert enc/dec operate on per-frame codewords (length W = N_s_base)
+      - Whole burst -> channel -> per-frame decode -> temporal fusion
+      - Pilots/headers: accounted in loss (B_est), not yet inserted as symbols
+    """
+    def __init__(self, d_model=256, freeze_bert=False,
+                 N_s_base=64,            # mini-frame length W (data symbols)
+                 N_z=8,
+                 M_list=[4,16,64],            # e.g., [4,16,64]
+                 M_z=2,
+                 ns_modes=(0.1, 0.25, 0.5, 0.75, 1.0, 1.25),
+                 force_expert: int=None,
+                 # Schedule / overhead
+                 T_max=6,                # # mini-frames per burst (upper bound)
+                 pilot_P=10,             # scattered pilot spacing (used in loss)
+                 r_c=0.8,                # code rate (payload calc)
+                 O_hdr_bits=48,          # header bits per run start (used in loss)
+                 use_soft_hdr=True):
+        super().__init__()
+        self.d_model = d_model
+        self.N_s_base = int(N_s_base)   # == W
+        self.N_z = N_z
+        self.M_list = list(M_list)
+        self.bps_list = [int(math.log2(M)) for M in self.M_list]
+        self.K = len(self.M_list)
+        self.force_expert = force_expert
+        self.M_z = M_z
+        self.bps_z = int(math.log2(M_z))
+        self.ns_modes = torch.tensor(ns_modes, dtype=torch.float32)
+
+        # schedule/overhead
+        self.T_max = int(T_max)
+        self.pilot_P = float(pilot_P)
+        self.r_c = float(r_c)
+        self.O_hdr_bits = float(O_hdr_bits)
+        self.use_soft_hdr = bool(use_soft_hdr)
+
+        # ----- Semantic encoder / decoder -----
+        self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
+        self.decoder = nn.Sequential(nn.Linear(2*d_model, 256), nn.ReLU(),
+                                     nn.Linear(256, 2))
+
+        # ----- Hyperprior (entropy model) -----
+        self.hyper_encoder = nn.Sequential(nn.Linear(d_model + 1, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
+        self.hyper_decoder = nn.Sequential(nn.Linear(d_model, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
+
+        # Side-channel mapper (z)
+        self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)   # bits
+        self.hyper_channel_decoder = nn.Linear(2 * N_z, d_model)            # from IQ symbols
+
+        # ----- Per-expert per-frame encoders/decoders -----
+        # We reuse a tiny frame embedding so frames don't repeat content.
+        self.frame_embed = nn.Embedding(self.T_max, d_model)
+        self.channel_encoders = nn.ModuleList([
+            nn.Linear(d_model, self.N_s_base * bps) for bps in self.bps_list
+        ])
+        self.channel_decoders = nn.ModuleList([
+            nn.Linear(2 * self.N_s_base, d_model) for _ in self.bps_list
+        ])
+
+        # ----- Router heads -----
+        # Base features: [logSNR, mean|z|, mean logσ+, var logσ+]
+        self.router = SemanticRouter(d_in=4, n_experts=self.K)  # legacy single-block head
+        self.ns_head = nn.Sequential(nn.Linear(4, 64), nn.ReLU(),
+                                     nn.Linear(64, len(ns_modes)))  # legacy Ns head
+
+        # Sequence routing heads (per mini-frame)
+        self.route_seq_head = nn.Linear(4, self.K)       # per t expert logits
+        self.boundary_head  = nn.Linear(4, 2)            # per t stay/switch logits
+
+    # --------- utilities ---------
+    @staticmethod
+    def _router_feat(snr_feat, z_like, sigma_like):
+        B = snr_feat.size(0)
+        mean_abs_z = z_like.abs().mean(dim=1, keepdim=True)
+        logsig = torch.log1p(F.softplus(sigma_like).abs() + 1e-6)
+        mu_logsig = logsig.mean(dim=1, keepdim=True)
+        var_logsig = logsig.var(dim=1, unbiased=False, keepdim=True)
+        return torch.cat([snr_feat, mean_abs_z, mu_logsig, var_logsig], dim=1)  # [B,4]
+
+    def build_schedule(self, feat, T=None, snr_seq=None, tau=1.0, hard=True):
+        B = feat.size(0)
+        T = T or self.T_max
+
+        # (unchanged) tile features & optionally inject per-frame logSNR
+        feat_t = feat.unsqueeze(1).expand(B, T, feat.size(1)).contiguous()
+        if snr_seq is not None:
+            logsnr_t = torch.log(snr_seq.clamp_min(1e-9))
+            feat_t[:, :, 0] = logsnr_t
+
+        # expert probs per frame
+        logits_e = self.route_seq_head(feat_t)                # [B,T,K]
+        pi_seq   = F.gumbel_softmax(logits_e, tau=tau, hard=False, dim=-1)
+
+        # stay/switch head
+        logits_b = self.boundary_head(feat_t)                 # [B,T,2]
+        b_probs  = F.softmax(logits_b, dim=-1)                # [B,T,2]
+        ps       = b_probs[..., 1]                            # [B,T], P(switch)
+
+        # >>> FIX: do NOT write in-place into ps / b_probs <<<
+        if T > 1:
+            ones_first = torch.ones(B, 1, device=ps.device, dtype=ps.dtype)
+            p_switch   = torch.cat([ones_first, ps[:, 1:]], dim=1)  # [B,T]
+        else:
+            p_switch   = torch.ones(B, 1, device=ps.device, dtype=ps.dtype)
+
+        # hard routes and hard switch mask
+        if hard:
+            z_seq = F.gumbel_softmax(logits_e, tau=tau, hard=True, dim=-1)  # [B,T,K]
+            z_idx = z_seq.argmax(dim=-1)                                    # [B,T]
+            sw_mask = torch.zeros_like(p_switch)
+            sw_mask[:, 0] = 1.0
+            if T > 1:
+                sw_mask[:, 1:] = (z_idx[:, 1:] != z_idx[:, :-1]).float()
+        else:
+            z_seq = pi_seq
+            z_idx = z_seq.argmax(dim=-1)
+            sw_mask = torch.zeros_like(p_switch)
+            sw_mask[:, 0] = 1.0
+            if T > 1:
+                sw_mask[:, 1:] = 0.5 * (pi_seq[:, 1:, :] - pi_seq[:, :-1, :]).abs().sum(-1).clamp(0, 1)
+
+        return dict(pi_seq=pi_seq, z_seq=z_seq, z_idx=z_idx,
+                    p_sw=p_switch, sw_mask=sw_mask)
+
+    @staticmethod
+    def _plan_stopping_mask(B_est_hard, R_tot_est):
+        """
+        Greedy stopping: include frames until cum bits >= R_tot_est.
+        Inputs:
+        B_est_hard: [B,T] (nonnegative)
+        R_tot_est:  [B]   (target bits)
+        Returns:
+        mask: [B,T] in {0,1}
+        """
+        # cumulative bits
+        csum = torch.cumsum(B_est_hard, dim=1)                        # [B,T]
+        R = R_tot_est.view(-1, 1)                                     # [B,1]
+
+        # need: frames strictly before crossing
+        need = (csum < R).float()                                     # [B,T]
+
+        # cross: once csum >= R, stays 1 thereafter (monotone)
+        cross = (csum >= R).float()                                   # [B,T]
+
+        # first_cross: 1 only at the FIRST index where cross flips from 0->1
+        first_cross = torch.zeros_like(cross)
+        first_cross[:, 0] = cross[:, 0]
+        if cross.size(1) > 1:
+            first_cross[:, 1:] = cross[:, 1:] * (1.0 - cross[:, :-1]) # [B,T-1]
+
+        # base mask: all pre-cross frames + the first crossing frame
+        mask = (need + first_cross).clamp_(0.0, 1.0)                  # [B,T]
+
+        # if never crosses (sum < target), include ALL frames
+        never = (csum[:, -1] < R.squeeze(1)).float().view(-1, 1)      # [B,1]
+        if never.any():
+            mask = mask + never * torch.ones_like(mask)
+            mask.clamp_(0.0, 1.0)
+
+        return mask
+
+    def forward(self, input_ids, attention_mask, n_var, channel='AWGN',
+                return_probs=False, snr_seq=None, tau=1.0):
+        """
+        Outputs:
+          logits [B,C], rate_bits [B],
+          route_sel (legacy) [B,K], Ns_eff (legacy) [B],
+          sched dict: pi_seq,z_seq,z_idx,p_sw,sw_mask,B_est,B_est_hard,B_sum,..., frame_mask
+        """
+        B, device = input_ids.size(0), input_ids.device
+        chan = Channels()
+
+        # 1) semantic encoder
+        y = self.encoder(input_ids, attention_mask)  # [B, d_model]
+
+        # 2) hyperprior (TX-side estimate)
+        if torch.is_tensor(n_var):
+            logsnr = torch.log(1.0/n_var).view(-1,1)
+        else:
+            logsnr = torch.full((B,1), math.log(1.0/n_var), device=device)
+        snr_feat = logsnr
+        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))   
+        z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else z.round()
+        raw_sigma = self.hyper_decoder(z_tilde)
+        sigma_tx = F.softplus(raw_sigma) + 1e-6 #Rate calc uses TX sigma
+
+        # 3) router features
+        feat = self._router_feat(snr_feat, z_tilde, raw_sigma)
+        # 3a) build schedule routing over the mini frame (hard for real or soft for training)
+        sched = self.build_schedule(feat, T=self.T_max, snr_seq=snr_seq, tau=tau, hard=True) # SNR_seq is currently none,  
+        pi_seq, z_seq, z_idx = sched['pi_seq'], sched['z_seq'], sched['z_idx']    # [B,T,K], [B,T,K], [B,T]
+        p_sw, sw_mask = sched['p_sw'], sched['sw_mask']  #first frame header                          # [B,T], [B,T]
+        z_idx       = sched["z_idx"]         # [B,T]
+        
 
 
-    
+        # 4) expected payload (for budget loss)
+        rho_pilot = 1.0 / self.pilot_P                                              # pilot fraction
+        W = float(self.N_s_base)                                                    #Bits per frame
+        m_vec = torch.tensor(self.bps_list, device=device, dtype=torch.float32)
+        bits_per_sym_soft = (pi_seq @ m_vec)                                      # [B,T]
+        B_est = (1.0 - rho_pilot) * W * self.r_c * bits_per_sym_soft              # [B,T] # payload bits estimate
+        # subtract header cost (first frame always has header)
+        hdr_cost = (p_sw if self.use_soft_hdr else sw_mask) * self.O_hdr_bits
+        B_est = torch.clamp(B_est - hdr_cost, min=0.0)
+        bits_per_sym_hard = m_vec[z_idx]                                          # [B,T]
+        B_est_hard = torch.clamp((1.0 - rho_pilot) * W * self.r_c * bits_per_sym_hard
+                                  - sw_mask * self.O_hdr_bits, min=0.0)
+        B_sum = B_est.sum(dim=1)                                                  # [B]
+        B_sum_hard = B_est_hard.sum(dim=1)                                        # [B]
 
+        # 5) TX-side bitrate estimate (for stopping rule mask)
+        # Use hyperprior's TX sigma to estimate required main-channel bits
+        p_y_tx = discrete_probability(y, torch.zeros_like(y), sigma_tx)
+        bits_y_tx = -torch.log2(p_y_tx + 1e-9).sum(dim=1)                         # [B] # Total bits frames used
+        R_tot_est = bits_y_tx.detach()                                            # planning target (no grad)
 
+        frame_mask = self._plan_stopping_mask(B_est_hard, R_tot_est)              # [B,T] in {0,1}
+        sched.update(dict(B_est=B_est, B_est_hard=B_est_hard,
+                          B_sum=B_sum, B_sum_hard=B_sum_hard,
+                          n_headers=sw_mask.sum(1), n_headers_soft=p_sw.sum(1),
+                          rho_pilot=rho_pilot, W=W, r_c=self.r_c,
+                          frame_mask=frame_mask)) #update sched dict
+        
+
+        # 6) Build per-frame codewords (data only, pilots implicit in loss)
+        #    For each expert k and frame t: enc_k(y + e_t) -> bits -> symbols(M_k)
+        y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else y.round()
+        T = self.T_max
+        Ns = self.N_s_base
+        frame_feats = []
+        for t in range(T):
+            y_t = y_tilde + self.frame_embed.weight[t]          # [B,d_model]
+            # produce symbols for ALL experts, then select per z_seq[:,t]
+            syms_per_k = []
+            for i, bps in enumerate(self.bps_list):
+                bits = self.channel_encoders[i](y_t)             # [B, Ns*bps]
+                bits = gumbel_sigmoid(bits, τ=1.0, hard=self.training)
+                syms = map_to_constellation(bits.view(B, Ns, bps), self.M_list[i])  # [B,Ns,2]
+                syms_per_k.append(syms)
+            Sy_t = torch.stack(syms_per_k, dim=-1)               # [B, Ns, 2, K]
+            # select expert for this frame (hard one-hot)
+            Sy_t_sel = (Sy_t * z_seq[:,t].view(B,1,1,self.K)).sum(dim=-1)   # [B, Ns, 2]
+            frame_feats.append(Sy_t_sel)
+        Sy_all = torch.stack(frame_feats, dim=1)                 # [B, T, Ns, 2]
+
+        # 7) Side-channel z symbols (sent once at burst head)
+        z_bits = self.hyper_channel_encoder(z_tilde)                                   # [B, N_z*bps_z]
+        z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)  # [B,N_z,2]
+        z_flat = z_syms.view(B, -1)
+        z_flat = z_flat / (z_flat.pow(2).mean(dim=1, keepdim=True).sqrt() + 1e-9)
+
+        # 8) Concatenate z + all frames into one burst and send through channel
+        Sy_seq = Sy_all.reshape(B, -1, 2)                           # [B, T*Ns, 2]
+        Tx_seq = torch.cat([z_flat, Sy_seq.view(B, -1)], dim=1)     # flatten to [B, 2*(N_z + T*Ns)]
+        chan_in = Tx_seq
+
+        if channel == 'AWGN':
+            Rx_seq = chan.AWGN(chan_in, n_var)
+        elif channel == 'Rayleigh':
+            Rx_seq = chan.Rayleigh(chan_in, n_var)
+        else:
+            Rx_seq = chan.Rician(chan_in, n_var)
+
+        # 9) Split back: z then per-frame data blocks, decode per selected expert
+        y_dim = 2 * self.N_s_base
+        z_rx, y_rx_flat = Rx_seq[:, :2*self.N_z], Rx_seq[:, 2*self.N_z:]
+        # (We assume perfect header knowledge for picking the decoder; headers are budgeted in loss.)
+        y_rx = y_rx_flat.view(B, T, y_dim)                          # [B,T, 2*Ns]
+        # decode with all experts then select using z_seq
+        per_t_feats = []
+        for t in range(T):
+            y_rt = y_rx[:, t, :]                                    # [B, 2*Ns]
+            dec_k = []
+            for i in range(self.K):
+                dec_k.append(self.channel_decoders[i](y_rt))        # [B, d_model]
+            dec_all = torch.stack(dec_k, dim=-1)                    # [B, d_model, K]
+            feat_t = (dec_all * z_seq[:,t].view(B,1,self.K)).sum(dim=-1)  # [B,d_model]
+            per_t_feats.append(feat_t)
+        y_feat_seq = torch.stack(per_t_feats, dim=1)                # [B, T, d_model]
+
+        # 10) Fuse over frames with stopping mask (average only used frames)
+        w = frame_mask.to(y_feat_seq.dtype).unsqueeze(-1)           # [B,T,1]
+        used = (w.sum(dim=1) + 1e-6)                                # [B,1]
+        feat_pooled = (y_feat_seq * w).sum(dim=1) / used            # [B, d_model]
+
+        # 11) Side-channel decode to recover sigma_rec (for entropy model)
+        z_hat = self.hyper_channel_decoder(z_rx)
+        sigma_rec = F.softplus(self.hyper_decoder(z_hat)) + 1e-6
+
+        # 12) Task head
+        logits = self.decoder(torch.cat([feat_pooled, sigma_rec], dim=1))     # [B, C]
+
+        # 13) Entropy-model rate (post-RX, for logging/alt-target)
+        p_y = discrete_probability(y, torch.zeros_like(y), sigma_rec)
+        p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
+        bits_y = -torch.log2(p_y + 1e-9).sum(dim=1)
+        bits_z = -torch.log2(p_z + 1e-9).sum(dim=1)
+        rate_bits = bits_y + bits_z
+        frame_mask  = sched["frame_mask"]    # [B,T]
+
+        # "route_hard_tx" for logging/back-compat: take the first frame's expert
+        route_hard_tx = F.one_hot(z_idx[:, 0], num_classes=self.K).float()  # [B,K]
+
+        # "Ns_eff" is now the total used symbols = (# used frames) * W
+        Ns_eff = (frame_mask.sum(dim=1) * self.N_s_base).long() 
+
+        if return_probs:
+            # Optionally expose per-frame soft probs for analysis
+            route_probs_seq = sched["pi_seq"]   # [B,T,K]
+            return (logits, rate_bits, route_hard_tx, Ns_eff,
+                    route_probs_seq, None, {**sched})
+        else:
+            return logits, rate_bits, route_hard_tx, Ns_eff, {**sched}
+
+import math, torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MODJSCC_MoE_Recon(nn.Module):
+    """
+    Time-unrolled PHY w/ MoE routing + reconstruction task:
+      - One modulation per mini-frame (T_max frames per burst)
+      - Per-frame expert routing (hard, ST) and stay/switch head
+      - Per-expert enc/dec operate on per-frame codewords (length W = N_s_base)
+      - Whole burst -> channel -> per-frame decode -> temporal fusion
+      - Pilots/headers: accounted in rate estimate (B_est), not inserted as symbols
+      - TASK: reconstruct the semantic embedding y produced by the RoBERTa encoder
+    """
+    def __init__(self, d_model=256, freeze_bert=False,
+                 N_s_base=64,            # mini-frame length W (data symbols)
+                 N_z=8,
+                 M_list=[4,16,64],       # per-expert constellations
+                 M_z=2,
+                 ns_modes=(0.1, 0.25, 0.5, 0.75, 1.0, 1.25),
+                 force_expert: int=None,
+                 # Schedule / overhead
+                 T_max=6,                # # mini-frames per burst (upper bound)
+                 pilot_P=10,             # scattered pilot spacing (used in loss)
+                 r_c=0.8,                # code rate (payload calc)
+                 O_hdr_bits=48,          # header bits per run start (used in loss)
+                 use_soft_hdr=True):
+        super().__init__()
+        self.d_model = d_model
+        self.N_s_base = int(N_s_base)   # == W
+        self.N_z = N_z
+        self.M_list = list(M_list)
+        self.bps_list = [int(math.log2(M)) for M in self.M_list]
+        self.K = len(self.M_list)
+        self.force_expert = force_expert
+        self.M_z = M_z
+        self.bps_z = int(math.log2(M_z))
+        self.ns_modes = torch.tensor(ns_modes, dtype=torch.float32)
+
+        # schedule/overhead
+        self.T_max = int(T_max)
+        self.pilot_P = float(pilot_P)
+        self.r_c = float(r_c)
+        self.O_hdr_bits = float(O_hdr_bits)
+        self.use_soft_hdr = bool(use_soft_hdr)
+
+        # ----- Semantic encoder -----
+        self.encoder = RoBERTaEncoder(d_model=d_model, freeze_bert=freeze_bert)
+
+        # ----- Reconstruction head (replaces classifier) -----
+        # Input is concat([feat_pooled, sigma_rec]) of size 2*d_model → d_model
+        self.recon_head = nn.Sequential(
+            nn.Linear(2 * d_model, 512),
+            nn.ReLU(),
+            nn.Linear(512, d_model)
+        )
+
+        # ----- Hyperprior (entropy model) -----
+        self.hyper_encoder = nn.Sequential(nn.Linear(d_model + 1, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
+        self.hyper_decoder = nn.Sequential(nn.Linear(d_model, 128),
+                                           nn.ReLU(),
+                                           nn.Linear(128, d_model))
+
+        # Side-channel mapper (z)
+        self.hyper_channel_encoder = nn.Linear(d_model, N_z * self.bps_z)   # bits
+        self.hyper_channel_decoder = nn.Linear(2 * N_z, d_model)            # from IQ symbols
+
+        # ----- Per-expert per-frame encoders/decoders -----
+        self.frame_embed = nn.Embedding(self.T_max, d_model)
+        self.channel_encoders = nn.ModuleList([
+            nn.Linear(d_model, self.N_s_base * bps) for bps in self.bps_list
+        ])
+        self.channel_decoders = nn.ModuleList([
+            nn.Linear(2 * self.N_s_base, d_model) for _ in self.bps_list
+        ])
+
+        # ----- Router heads -----
+        # Base features: [logSNR, mean|z|, mean logσ+, var logσ+]
+        self.router = SemanticRouter(d_in=4, n_experts=self.K)  # legacy single-block head
+        self.ns_head = nn.Sequential(nn.Linear(4, 64), nn.ReLU(),
+                                     nn.Linear(64, len(ns_modes)))  # legacy Ns head
+
+        # Sequence routing heads (per mini-frame)
+        self.route_seq_head = nn.Linear(4, self.K)       # per t expert logits
+        self.boundary_head  = nn.Linear(4, 2)            # per t stay/switch logits
+
+    # --------- utilities ---------
+    @staticmethod
+    def _router_feat(snr_feat, z_like, sigma_like):
+        B = snr_feat.size(0)
+        mean_abs_z = z_like.abs().mean(dim=1, keepdim=True)
+        logsig = torch.log1p(F.softplus(sigma_like).abs() + 1e-6)
+        mu_logsig = logsig.mean(dim=1, keepdim=True)
+        var_logsig = logsig.var(dim=1, unbiased=False, keepdim=True)
+        return torch.cat([snr_feat, mean_abs_z, mu_logsig, var_logsig], dim=1)  # [B,4]
+
+    def build_schedule(self, feat, T=None, snr_seq=None, tau=1.0, hard=True):
+        B = feat.size(0)
+        T = T or self.T_max
+
+        # tile features & optionally inject per-frame logSNR
+        feat_t = feat.unsqueeze(1).expand(B, T, feat.size(1)).contiguous()
+        if snr_seq is not None:
+            logsnr_t = torch.log(snr_seq.clamp_min(1e-9))
+            feat_t[:, :, 0] = logsnr_t
+
+        # expert probs per frame
+        logits_e = self.route_seq_head(feat_t)                # [B,T,K]
+        pi_seq   = F.gumbel_softmax(logits_e, tau=tau, hard=False, dim=-1)
+
+        # stay/switch head
+        logits_b = self.boundary_head(feat_t)                 # [B,T,2]
+        b_probs  = F.softmax(logits_b, dim=-1)                # [B,T,2]
+        ps       = b_probs[..., 1]                            # [B,T], P(switch)
+
+        # avoid in-place ops on ps/b_probs
+        if T > 1:
+            ones_first = torch.ones(B, 1, device=ps.device, dtype=ps.dtype)
+            p_switch   = torch.cat([ones_first, ps[:, 1:]], dim=1)  # [B,T]
+        else:
+            p_switch   = torch.ones(B, 1, device=ps.device, dtype=ps.dtype)
+
+        # hard routes and hard switch mask
+        if hard:
+            z_seq = F.gumbel_softmax(logits_e, tau=tau, hard=True, dim=-1)  # [B,T,K]
+            z_idx = z_seq.argmax(dim=-1)                                    # [B,T]
+            sw_mask = torch.zeros_like(p_switch)
+            sw_mask[:, 0] = 1.0
+            if T > 1:
+                sw_mask[:, 1:] = (z_idx[:, 1:] != z_idx[:, :-1]).float()
+        else:
+            z_seq = pi_seq
+            z_idx = z_seq.argmax(dim=-1)
+            sw_mask = torch.zeros_like(p_switch)
+            sw_mask[:, 0] = 1.0
+            if T > 1:
+                sw_mask[:, 1:] = 0.5 * (pi_seq[:, 1:, :] - pi_seq[:, :-1, :]).abs().sum(-1).clamp(0, 1)
+
+        return dict(pi_seq=pi_seq, z_seq=z_seq, z_idx=z_idx,
+                    p_sw=p_switch, sw_mask=sw_mask)
+
+    @staticmethod
+    def _plan_stopping_mask(B_est_hard, R_tot_est):
+        """
+        Greedy stopping: include frames until cum bits >= R_tot_est.
+        Inputs:
+        B_est_hard: [B,T] (nonnegative)
+        R_tot_est:  [B]   (target bits)
+        Returns:
+        mask: [B,T] in {0,1}
+        """
+        csum = torch.cumsum(B_est_hard, dim=1)                        # [B,T]
+        R = R_tot_est.view(-1, 1)                                     # [B,1]
+
+        need = (csum < R).float()                                     # [B,T]
+        cross = (csum >= R).float()                                   # [B,T]
+
+        first_cross = torch.zeros_like(cross)
+        first_cross[:, 0] = cross[:, 0]
+        if cross.size(1) > 1:
+            first_cross[:, 1:] = cross[:, 1:] * (1.0 - cross[:, :-1]) # [B,T-1]
+
+        mask = (need + first_cross).clamp_(0.0, 1.0)                  # [B,T]
+
+        never = (csum[:, -1] < R.squeeze(1)).float().view(-1, 1)      # [B,1]
+        if never.any():
+            mask = mask + never * torch.ones_like(mask)
+            mask.clamp_(0.0, 1.0)
+
+        return mask
+
+    def forward(self, input_ids, attention_mask, n_var, channel='AWGN',
+                return_probs=False, snr_seq=None, tau=1.0):
+        """
+        Outputs (reconstruction task):
+          recon [B, d_model], rate_bits [B],
+          route_hard_tx [B,K], Ns_eff [B],
+          sched dict (includes: pi_seq,z_seq,z_idx,p_sw,sw_mask,B_est,..., frame_mask, y_target)
+        """
+        B, device = input_ids.size(0), input_ids.device
+        chan = Channels()
+
+        # 1) semantic encoder (target to reconstruct)
+        y = self.encoder(input_ids, attention_mask)  # [B, d_model]
+
+        # 2) hyperprior (TX-side estimate)
+        if torch.is_tensor(n_var):
+            logsnr = torch.log(1.0/n_var).view(-1,1)
+        else:
+            logsnr = torch.full((B,1), math.log(1.0/n_var), device=device)
+        snr_feat = logsnr
+        z = self.hyper_encoder(torch.cat([y, snr_feat], dim=1))
+        z_tilde = z + (torch.rand_like(z) - 0.5) if self.training else z.round()
+        raw_sigma = self.hyper_decoder(z_tilde)
+        sigma_tx = F.softplus(raw_sigma) + 1e-6  # used for TX-side rate calc
+
+        # 3) router features + schedule
+        feat = self._router_feat(snr_feat, z_tilde, raw_sigma)
+        sched = self.build_schedule(feat, T=self.T_max, snr_seq=snr_seq, tau=tau, hard=True)
+        pi_seq, z_seq, z_idx = sched['pi_seq'], sched['z_seq'], sched['z_idx']    # [B,T,K], [B,T,K], [B,T]
+        p_sw, sw_mask = sched['p_sw'], sched['sw_mask']                            # [B,T], [B,T]
+
+        # 4) expected payload (for budget loss)
+        rho_pilot = 1.0 / self.pilot_P
+        W = float(self.N_s_base)
+        m_vec = torch.tensor(self.bps_list, device=device, dtype=torch.float32)
+        bits_per_sym_soft = (pi_seq @ m_vec)                                       # [B,T]
+        B_est = (1.0 - rho_pilot) * W * self.r_c * bits_per_sym_soft               # [B,T]
+        hdr_cost = (p_sw if self.use_soft_hdr else sw_mask) * self.O_hdr_bits
+        B_est = torch.clamp(B_est - hdr_cost, min=0.0)
+        bits_per_sym_hard = m_vec[z_idx]                                           # [B,T]
+        B_est_hard = torch.clamp((1.0 - rho_pilot) * W * self.r_c * bits_per_sym_hard
+                                  - sw_mask * self.O_hdr_bits, min=0.0)
+        B_sum = B_est.sum(dim=1)                                                   # [B]
+        B_sum_hard = B_est_hard.sum(dim=1)                                         # [B]
+
+        # 5) TX-side bitrate estimate (for stopping rule mask)
+        p_y_tx = discrete_probability(y, torch.zeros_like(y), sigma_tx)
+        bits_y_tx = -torch.log2(p_y_tx + 1e-9).sum(dim=1)                          # [B]
+        R_tot_est = bits_y_tx.detach()                                             # planning target (no grad)
+
+        frame_mask = self._plan_stopping_mask(B_est_hard, R_tot_est)               # [B,T]
+        sched.update(dict(B_est=B_est, B_est_hard=B_est_hard,
+                          B_sum=B_sum, B_sum_hard=B_sum_hard,
+                          n_headers=sw_mask.sum(1), n_headers_soft=p_sw.sum(1),
+                          rho_pilot=rho_pilot, W=W, r_c=self.r_c,
+                          frame_mask=frame_mask))
+
+        # 6) Build per-frame codewords (data only)
+        y_tilde = y + (torch.rand_like(y) - 0.5) if self.training else y.round()
+        T = self.T_max
+        Ns = self.N_s_base
+        frame_feats = []
+        for t in range(T):
+            y_t = y_tilde + self.frame_embed.weight[t]          # [B,d_model]
+            syms_per_k = []
+            for i, bps in enumerate(self.bps_list):
+                bits = self.channel_encoders[i](y_t)             # [B, Ns*bps]
+                bits = gumbel_sigmoid(bits, τ=1.0, hard=self.training)
+                syms = map_to_constellation(bits.view(B, Ns, bps), self.M_list[i])  # [B,Ns,2]
+                syms_per_k.append(syms)
+            Sy_t = torch.stack(syms_per_k, dim=-1)               # [B, Ns, 2, K]
+            Sy_t_sel = (Sy_t * z_seq[:,t].view(B,1,1,self.K)).sum(dim=-1)   # [B, Ns, 2]
+            frame_feats.append(Sy_t_sel)
+        Sy_all = torch.stack(frame_feats, dim=1)                 # [B, T, Ns, 2]
+
+        # 7) Side-channel z symbols (sent once at burst head)
+        z_bits = self.hyper_channel_encoder(z_tilde)                                   # [B, N_z*bps_z]
+        z_syms = map_to_constellation(z_bits.view(B, self.N_z, self.bps_z), self.M_z)  # [B,N_z,2]
+        z_flat = z_syms.view(B, -1)
+        z_flat = z_flat / (z_flat.pow(2).mean(dim=1, keepdim=True).sqrt() + 1e-9)
+
+        # 8) Concatenate z + all frames into one burst and send through channel
+        Sy_seq = Sy_all.reshape(B, -1, 2)                           # [B, T*Ns, 2]
+        Tx_seq = torch.cat([z_flat, Sy_seq.view(B, -1)], dim=1)     # [B, 2*(N_z + T*Ns)]
+        chan_in = Tx_seq
+
+        if channel == 'AWGN':
+            Rx_seq = chan.AWGN(chan_in, n_var)
+        elif channel == 'Rayleigh':
+            Rx_seq = chan.Rayleigh(chan_in, n_var)
+        else:
+            Rx_seq = chan.Rician(chan_in, n_var)
+
+        # 9) Split back: z then per-frame data blocks, decode per selected expert
+        y_dim = 2 * self.N_s_base
+        z_rx, y_rx_flat = Rx_seq[:, :2*self.N_z], Rx_seq[:, 2*self.N_z:]
+        y_rx = y_rx_flat.view(B, T, y_dim)                          # [B,T, 2*Ns]
+        per_t_feats = []
+        for t in range(T):
+            y_rt = y_rx[:, t, :]                                    # [B, 2*Ns]
+            dec_k = []
+            for i in range(self.K):
+                dec_k.append(self.channel_decoders[i](y_rt))        # [B, d_model]
+            dec_all = torch.stack(dec_k, dim=-1)                    # [B, d_model, K]
+            feat_t = (dec_all * z_seq[:,t].view(B,1,self.K)).sum(dim=-1)  # [B,d_model]
+            per_t_feats.append(feat_t)
+        y_feat_seq = torch.stack(per_t_feats, dim=1)                # [B, T, d_model]
+
+        # 10) Fuse over frames with stopping mask (average only used frames)
+        w = frame_mask.to(y_feat_seq.dtype).unsqueeze(-1)           # [B,T,1]
+        used = (w.sum(dim=1) + 1e-6)                                # [B,1]
+        feat_pooled = (y_feat_seq * w).sum(dim=1) / used            # [B, d_model]
+
+        # 11) Side-channel decode to recover sigma_rec (for entropy model)
+        z_hat = self.hyper_channel_decoder(z_rx)
+        sigma_rec = F.softplus(self.hyper_decoder(z_hat)) + 1e-6
+
+        # 12) RECONSTRUCTION head (predict y_hat)
+        recon = self.recon_head(torch.cat([feat_pooled, sigma_rec], dim=1))  # [B, d_model]
+
+        # 13) Entropy-model rate (post-RX, for logging/alt-target)
+        p_y = discrete_probability(y, torch.zeros_like(y), sigma_rec)
+        p_z = discrete_probability(z_tilde, torch.zeros_like(z_tilde), torch.ones_like(z_tilde))
+        rate_bits = -torch.log2(p_y + 1e-9).sum(dim=1) + -torch.log2(p_z + 1e-9).sum(dim=1)
+
+        frame_mask  = sched["frame_mask"]    # [B,T]
+        route_hard_tx = F.one_hot(z_idx[:, 0], num_classes=self.K).float()  # [B,K]
+        Ns_eff = (frame_mask.sum(dim=1) * self.N_s_base).long()
+
+        # expose target embedding for convenient loss computation
+        sched["y_target"] = y.detach()
+
+        if return_probs:
+            route_probs_seq = sched["pi_seq"]   # [B,T,K]
+            return (recon, rate_bits, route_hard_tx, Ns_eff,
+                    route_probs_seq, None, {**sched})
+        else:
+            return recon, rate_bits, route_hard_tx, Ns_eff, {**sched}
