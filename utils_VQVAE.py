@@ -13,7 +13,12 @@ from w3lib.html import remove_tags
 from nltk.translate.bleu_score import sentence_bleu
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-torch.autograd.set_detect_anomaly(True)
+# NOTE: anomaly detection is extremely slow; enable only when debugging.
+torch.autograd.set_detect_anomaly(False)
+
+def unwrap(m):
+    """Unwrap DDP/DataParallel wrapper if present."""
+    return m.module if hasattr(m, "module") else m
 
 def format_time(elapsed):
     return str(datetime.timedelta(seconds=int(round((elapsed)))))
@@ -193,177 +198,6 @@ import torch.nn.functional as F
 from torch.amp import autocast, GradScaler  # optional mixed precision
 
 
-def train_one_epoch(
-    model: nn.Module,
-    dataloader,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    lambda_rate: float = 1e-4,   # weight on rate (bits) term
-    lambda_vq: float = 1.0,      # weight on VQ loss term
-    max_grad_norm: float | None = 1.0,
-    use_amp: bool = False,
-):
-    """
-    Train for one epoch.
-
-    Dataloader must yield: (input_ids, attention_mask, n_var)
-      - input_ids:     [B, L]
-      - attention_mask:[B, L]
-      - n_var:         scalar or [B] noise variance for AWGN
-
-    Returns:
-        metrics dict with average losses and stats.
-    """
-    model.train()
-    scaler = GradScaler(enabled=use_amp)
-
-    recon_loss_sum = 0.0
-    rate_loss_sum = 0.0
-    vq_loss_sum = 0.0
-    total_loss_sum = 0.0
-    n_batches = 0
-
-    for batch in dataloader:
-        # unpack batch
-        if isinstance(batch, dict):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            n_var = batch.get("n_var", 0.01)
-        else:
-            input_ids, attention_mask, n_var = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-
-        if torch.is_tensor(n_var):
-            n_var = n_var.to(device)
-
-        optimizer.zero_grad(set_to_none=True)
-
-        with autocast(enabled=use_amp):
-            recon, rate_bits, route_hard_tx, Ns_eff, stats = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                n_var=n_var,
-                channel="AWGN",
-                return_probs=False,
-            )
-
-            # target semantic embedding (set in model forward)
-            y_target = stats["y_target"]  # [B, d_model]
-
-            # reconstruction loss (MSE on semantic embedding)
-            recon_loss = F.mse_loss(recon, y_target)
-
-            # rate loss = mean bits per block
-            rate_loss = rate_bits.mean()
-
-            # VQ commitment / codebook loss
-            vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
-
-            loss = recon_loss + lambda_rate * rate_loss + lambda_vq * vq_loss
-
-        if use_amp:
-            scaler.scale(loss).backward()
-            if max_grad_norm is not None:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
-
-        # accumulate stats
-        bs = input_ids.size(0)
-        recon_loss_sum += recon_loss.item() * bs
-        rate_loss_sum += rate_loss.item() * bs
-        vq_loss_sum += vq_loss.item() * bs
-        total_loss_sum += loss.item() * bs
-        n_batches += bs
-
-    return {
-        "loss": total_loss_sum / n_batches,
-        "recon_loss": recon_loss_sum / n_batches,
-        "rate_loss": rate_loss_sum / n_batches,
-        "vq_loss": vq_loss_sum / n_batches,
-    }
-
-
-@torch.no_grad()
-def eval_one_epoch(
-    model: nn.Module,
-    dataloader,
-    device: torch.device,
-    lambda_rate: float = 1e-4,
-    lambda_vq: float = 1.0,
-):
-    """
-    Evaluation loop (no gradient).
-
-    Same dataloader format as train_one_epoch.
-    """
-    model.eval()
-
-    recon_loss_sum = 0.0
-    rate_loss_sum = 0.0
-    vq_loss_sum = 0.0
-    total_loss_sum = 0.0
-    n_batches = 0
-
-    avg_bits = 0.0
-    avg_syms = 0.0
-
-    for batch in dataloader:
-        if isinstance(batch, dict):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            n_var = batch.get("n_var", 0.01)
-        else:
-            input_ids, attention_mask, n_var = batch
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-
-        if torch.is_tensor(n_var):
-            n_var = n_var.to(device)
-
-        recon, rate_bits, route_hard_tx, Ns_eff, stats = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            n_var=n_var,
-            channel="AWGN",
-            return_probs=False,
-        )
-
-        y_target = stats["y_target"]
-
-        recon_loss = F.mse_loss(recon, y_target)
-        rate_loss = rate_bits.mean()
-        vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
-
-        loss = recon_loss + lambda_rate * rate_loss + lambda_vq * vq_loss
-
-        bs = input_ids.size(0)
-        recon_loss_sum += recon_loss.item() * bs
-        rate_loss_sum += rate_loss.item() * bs
-        vq_loss_sum += vq_loss.item() * bs
-        total_loss_sum += loss.item() * bs
-        n_batches += bs
-
-        avg_bits += rate_bits.sum().item()
-        avg_syms += Ns_eff.sum().item()
-
-    return {
-        "loss": total_loss_sum / n_batches,
-        "recon_loss": recon_loss_sum / n_batches,
-        "rate_loss": rate_loss_sum / n_batches,
-        "vq_loss": vq_loss_sum / n_batches,
-        "avg_bits_per_block": avg_bits / n_batches,
-        "avg_syms_per_block": avg_syms / n_batches,
-    }
-from torch.cuda.amp import autocast, GradScaler
-
 
 
 def _load_balance_loss_from_probs(probs: torch.Tensor) -> torch.Tensor:
@@ -389,6 +223,26 @@ def _load_balance_loss_from_probs(probs: torch.Tensor) -> torch.Tensor:
     # D_KL(u || pi_bar) = sum_j u * log(u / pi_bar_j)
     lb = (u * torch.log(u / (pi_bar + 1e-8))).sum()
     return lb
+def switch_load_balance_loss(expert_probs: torch.Tensor, expert_idx: torch.Tensor, num_experts: int | None = None, eps: float = 1e-9):
+    """
+    expert_probs: [B, R]
+    expert_idx:   [B]
+    num_experts: optional, can be passed for compatibility (R is inferred from expert_probs)
+    """
+    B, R = expert_probs.shape
+    if num_experts is not None and num_experts != R:
+        # keep it strict to catch bugs
+        raise ValueError(f"num_experts={num_experts} but expert_probs has R={R}")
+
+    importance = expert_probs.sum(dim=0)  # [R]
+    load = torch.bincount(expert_idx, minlength=R).float().to(expert_probs.device)  # [R]
+
+    importance = importance / (importance.sum() + eps)
+    load = load / (load.sum() + eps)
+
+    return R * torch.sum(importance * load)
+
+
 
 
 def train_one_epoch_cls(
@@ -396,25 +250,29 @@ def train_one_epoch_cls(
     dataloader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    lambda_sym: float = 1e-4,        # symbol-time (latency) penalty
-    lambda_vq: float = 1.0,          # VQ commitment/codebook loss
-    lambda_lb: float = 0.0,          # load-balance regularizer
+    lambda_vec: float = 1.0,       # weight for latent distortion
+    lambda_sym: float = 0.0,       # symbol-time (latency) penalty
+    lambda_vq: float = 1.0,        # VQ commitment/codebook loss
+    lambda_lb: float = 0.0,        # load-balance regularizer
+    lambda_lat: float = 0.002,     # weight for latent mse loss
+    lambda_ch: float = 0.002,      # weight for channel mse loss
+    lambda_soft: float = 0.002,    # weight for behavior distillation loss
+    lambda_lat_kd: float = 0.2,    # weight for latent distillation loss
+    lambda_entropy: float = 0.0,   # weight for VQ entropy regularization (prevent routing collapse)
+    lambda_consistency: float = 0.0,  # weight for hard-soft consistency loss (alignment phase)
+    use_hard_forward: bool = False,   # enable hard-forward/soft-backward during alignment
     max_grad_norm: float | None = 1.0,
     use_amp: bool = False,
     snr_min_db: float = 0.0,
-    snr_max_db: float = 10.0,
+    snr_max_db: float = 20.0,
 ):
     """
     One epoch of training for CLASSIFICATION (e.g., SST-2).
 
     Noise SNR is sampled uniformly in [snr_min_db, snr_max_db] (dB) per sample.
 
-    Dataloader must yield either:
-      (input_ids, attention_mask, labels)
-    or a dict with keys: "input_ids", "attention_mask", "labels".
-
-    Total loss:
-      L = L_task (cls) + lambda_sym * J_sym + lambda_lb * J_lb + lambda_vq * L_VQ
+        Train loss (aligned with eval):
+            L = L_task (cls) + lambda_vec * L_latent + lambda_sym * J_sym + lambda_lb * J_lb + lambda_vq * L_VQ
     """
 
     model.train()
@@ -422,9 +280,18 @@ def train_one_epoch_cls(
 
     total_loss_sum = 0.0
     cls_loss_sum = 0.0
+    vec_loss_sum = 0.0
     sym_loss_sum = 0.0
     lb_loss_sum = 0.0
     vq_loss_sum = 0.0
+
+    # NOTE: auxiliary training-only losses were removed to align train/eval loss.
+    
+    # Collapse detection metrics
+    vq_entropy_sum = 0.0
+    sym_entropy_sum = 0.0
+    mean_llr_sum = 0.0
+    
     correct = 0
     n_samples = 0
 
@@ -453,37 +320,52 @@ def train_one_epoch_cls(
         optimizer.zero_grad(set_to_none=True)
 
         with autocast(enabled=use_amp):
-            logits, rate_bits, route_hard_tx, Ns_eff, stats = model(
+            logits, rate_bits, route_hard_tx, Ns_eff, stats_tx = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 n_var=n_var,          # per-sample noise variance
                 channel="AWGN",
                 return_probs=False,
             )
-
-            # Task loss: classification
             cls_loss = F.cross_entropy(logits, labels)
 
-            # J_sym: average symbol-time (latency) penalty (eq. 20 -> mean Nsym,b)
-            # Here we approximate Nsym,b by Ns_eff (payload symbols only).
-            sym_loss = Ns_eff.float().mean()
+            # Rate + VQ, your existing stuff
+            vec_loss = stats_tx["latent_mse"].mean() + stats_tx["channel_mse"].mean()
+            sym_loss = stats_tx["exp_syms_per_block"].mean()
+            lb_loss  = _load_balance_loss_from_probs(stats_tx["probs"])
+            vq_loss  = stats_tx["vq_loss"]
 
-            # Load-balance loss J_lb from router probabilities (eq. 22)
-            probs = stats["probs"]        # [B, J]
+            # IMPORTANT: keep train loss aligned with eval loss.
+            # (No training-only auxiliary terms counted into `loss`.)
+            loss = (
+                cls_loss
+                + lambda_vec * vec_loss
+                + lambda_sym * sym_loss
+                + lambda_lb * lb_loss
+                + lambda_vq * vq_loss
+            )
 
+            # loss = (
+            #     cls_loss
+            #     + lambda_kd * kd_loss
+            #     + lambda_lat_kd * latent_kd
+            #     + lambda_vec * vec_loss
+            #     + lambda_sym * sym_loss
+            #     + lambda_lb * lb_loss
+            #     + lambda_vq * vq_loss
+            # )
 
-            pi_bar = probs.mean(dim=0)
-            pi_bar = pi_bar / (pi_bar.sum() + 1e-8)
-            J = pi_bar.numel()
-            u = 1.0 / J
-            lb_loss = (u * torch.log(u / (pi_bar + 1e-8))).sum()
-            # lb_loss = _load_balance_loss_from_probs(probs)
+            # Total loss
+            # loss = (
+            #     cls_loss
+            #     + lambda_vec * vec_loss
+            #     + lambda_sym * sym_loss
+            #     + lambda_lb * lb_loss
+            #     + lambda_lat * stats_dig["latent_mse"].mean() 
+            #     + lambda_ch * stats_dig["channel_mse"].mean() 
+            #     + lambda_vq * vq_loss
 
-            # VQ loss
-            # vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
-            vq_loss = stats["vq_loss"]
-
-            loss = cls_loss + lambda_sym * sym_loss + lambda_lb * lb_loss + lambda_vq * vq_loss
+            # )
 
         if use_amp:
             scaler.scale(loss).backward()
@@ -502,9 +384,22 @@ def train_one_epoch_cls(
         bs = input_ids.size(0)
         total_loss_sum += loss.item() * bs
         cls_loss_sum += cls_loss.item() * bs
+        vec_loss_sum += vec_loss.item() * bs
         sym_loss_sum += sym_loss.item() * bs
         lb_loss_sum += lb_loss.item() * bs
         vq_loss_sum += vq_loss.item() * bs
+        # (aux losses intentionally not accumulated into epoch loss)
+        
+        # Collapse detection metrics
+        # (aux losses intentionally not accumulated into epoch loss)
+        
+        # Collapse detection metrics
+        if "vq_entropy" in stats_tx:
+            vq_entropy_sum += stats_tx["vq_entropy"].mean().item() * bs
+        if "sym_entropy" in stats_tx:
+            sym_entropy_sum += stats_tx["sym_entropy"].mean().item() * bs
+        if "mean_llr" in stats_tx:
+            mean_llr_sum += stats_tx["mean_llr"].mean().item() * bs
 
         preds = logits.argmax(dim=-1)
         batch_correct = (preds == labels).sum().item()
@@ -517,44 +412,59 @@ def train_one_epoch_cls(
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             cls=f"{cls_loss.item():.4f}",
+            vec=f"{vec_loss.item():.4f}",   # NEW
             sym=f"{sym_loss.item():.2f}",
             lb=f"{lb_loss.item():.3f}",
             acc=f"{batch_acc:.3f}",
             snr_db=f"{avg_snr_db:.1f}",
+            vq_T=f"{unwrap(model).transceiver_dig.vq_temp:.3f}",
+            sym_T=f"{unwrap(model).transceiver_dig.symbol_temp:.3f}",
         )
 
-    return {
+    metrics = {
         "loss": total_loss_sum / n_samples,
         "cls_loss": cls_loss_sum / n_samples,
+        "vec_loss": vec_loss_sum / n_samples,
         "sym_loss": sym_loss_sum / n_samples,
         "lb_loss": lb_loss_sum / n_samples,
         "vq_loss": vq_loss_sum / n_samples,
         "accuracy": correct / n_samples,
     }
-
+    
+    # Add collapse detection metrics if available
+    if vq_entropy_sum > 0:
+        metrics["vq_entropy"] = vq_entropy_sum / n_samples
+    if sym_entropy_sum > 0:
+        metrics["sym_entropy"] = sym_entropy_sum / n_samples
+    if mean_llr_sum > 0:
+        metrics["mean_llr"] = mean_llr_sum / n_samples
+        
+    return metrics
 @torch.no_grad()
 def eval_one_epoch_cls(
     model: nn.Module,
     dataloader,
     device: torch.device,
-    lambda_sym: float = 1e-4,
+    lambda_vec: float = 1.0,
+    lambda_sym: float = 1.0,
     lambda_vq: float = 1.0,
     lambda_lb: float = 0.0,
-    eval_snr_db: float = 5.0,
+    eval_snr_db: float = 20.0,
 ):
     """
     Evaluation loop for CLASSIFICATION.
 
     Fixed SNR (eval_snr_db in dB) for all samples.
 
-    Same total loss as in training:
-      L = L_task + lambda_sym * J_sym + lambda_lb * J_lb + lambda_vq * L_VQ
+    Total loss:
+      L = L_task + lambda_vec * L_latent + lambda_sym * J_sym + lambda_lb * J_lb + lambda_vq * L_VQ
     """
 
     model.eval()
 
     total_loss_sum = 0.0
     cls_loss_sum = 0.0
+    vec_loss_sum = 0.0
     sym_loss_sum = 0.0
     lb_loss_sum = 0.0
     vq_loss_sum = 0.0
@@ -563,6 +473,11 @@ def eval_one_epoch_cls(
 
     avg_bits = 0.0
     avg_syms = 0.0
+    
+    # Collapse detection metrics
+    vq_entropy_sum = 0.0
+    sym_entropy_sum = 0.0
+    mean_llr_sum = 0.0
 
     # fixed noise variance for eval
     snr_lin = 10.0 ** (eval_snr_db / 10.0)
@@ -581,7 +496,7 @@ def eval_one_epoch_cls(
             attention_mask = attention_mask.to(device)
             labels = labels.to(device)
 
-        logits, rate_bits, route_hard_tx, Ns_eff, stats = model(
+        logits, rate_bits, route_hard_tx, Ns_eff, stats_tx = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             n_var=n_var_eval,    # scalar, same for batch
@@ -590,18 +505,28 @@ def eval_one_epoch_cls(
         )
 
         cls_loss = F.cross_entropy(logits, labels)
-        sym_loss = Ns_eff.float().mean()
+        latent_mse = stats_tx ["latent_mse"]
+        channel_mse = stats_tx["channel_mse"]    
+        vec_loss = latent_mse.mean() +channel_mse.mean()      # NEW
+        sym_loss = stats_tx.get("exp_syms_per_block", torch.tensor(0.0, device=device)).mean()
 
-        probs = stats["probs"]
+        probs = stats_tx["probs"]
         lb_loss = _load_balance_loss_from_probs(probs)
 
-        vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
+        vq_loss = stats_tx.get("vq_loss", torch.tensor(0.0, device=device))
 
-        loss = cls_loss + lambda_sym * sym_loss + lambda_lb * lb_loss + lambda_vq * vq_loss
+        loss = (
+            cls_loss
+            + lambda_vec * vec_loss
+            + lambda_sym * sym_loss
+            + lambda_lb * lb_loss
+            + lambda_vq * vq_loss
+        )
 
         bs = input_ids.size(0)
         total_loss_sum += loss.item() * bs
         cls_loss_sum += cls_loss.item() * bs
+        vec_loss_sum += vec_loss.item() * bs
         sym_loss_sum += sym_loss.item() * bs
         lb_loss_sum += lb_loss.item() * bs
         vq_loss_sum += vq_loss.item() * bs
@@ -610,23 +535,33 @@ def eval_one_epoch_cls(
         batch_correct = (preds == labels).sum().item()
         correct += batch_correct
         n_samples += bs
-
-        avg_bits += rate_bits.sum().item()
-        avg_syms += Ns_eff.sum().item()
+        
+        avg_bits += stats_tx["bits_per_block"].sum().item()
+        avg_syms += stats_tx["syms_per_block"].sum().item()
+        
+        # Collapse detection metrics
+        if "vq_entropy" in stats_tx:
+            vq_entropy_sum += stats_tx["vq_entropy"].mean().item() * bs
+        if "sym_entropy" in stats_tx:
+            sym_entropy_sum += stats_tx["sym_entropy"].mean().item() * bs
+        if "mean_llr" in stats_tx:
+            mean_llr_sum += stats_tx["mean_llr"].mean().item() * bs
 
         batch_acc = batch_correct / bs
         pbar.set_postfix(
             loss=f"{loss.item():.4f}",
             cls=f"{cls_loss.item():.4f}",
+            vec=f"{vec_loss.item():.4f}",
             sym=f"{sym_loss.item():.2f}",
             lb=f"{lb_loss.item():.3f}",
             acc=f"{batch_acc:.3f}",
             snr_db=f"{eval_snr_db:.1f}",
         )
 
-    return {
+    metrics = {
         "loss": total_loss_sum / n_samples,
         "cls_loss": cls_loss_sum / n_samples,
+        "vec_loss": vec_loss_sum / n_samples,
         "sym_loss": sym_loss_sum / n_samples,
         "lb_loss": lb_loss_sum / n_samples,
         "vq_loss": vq_loss_sum / n_samples,
@@ -634,3 +569,529 @@ def eval_one_epoch_cls(
         "avg_bits_per_block": avg_bits / n_samples,
         "avg_syms_per_block": avg_syms / n_samples,
     }
+    
+    # Add collapse detection metrics if available
+    if vq_entropy_sum > 0:
+        metrics["vq_entropy"] = vq_entropy_sum / n_samples
+    if sym_entropy_sum > 0:
+        metrics["sym_entropy"] = sym_entropy_sum / n_samples
+    if mean_llr_sum > 0:
+        metrics["mean_llr"] = mean_llr_sum / n_samples
+        
+    return metrics
+
+# @torch.no_grad()
+# def eval_one_epoch_cls(
+#     model: nn.Module,
+#     dataloader,
+#     device: torch.device,
+#     lambda_sym: float = 1e-4,
+#     lambda_vq: float = 1.0,
+#     lambda_lb: float = 0.0,
+#     eval_snr_db: float = 5.0,
+# ):
+#     """
+#     Evaluation loop for CLASSIFICATION.
+
+#     Fixed SNR (eval_snr_db in dB) for all samples.
+
+#     Same total loss as in training:
+#       L = L_task + lambda_sym * J_sym + lambda_lb * J_lb + lambda_vq * L_VQ
+#     """
+
+#     model.eval()
+
+#     total_loss_sum = 0.0
+#     cls_loss_sum = 0.0
+#     sym_loss_sum = 0.0
+#     lb_loss_sum = 0.0
+#     vq_loss_sum = 0.0
+#     correct = 0
+#     n_samples = 0
+
+#     avg_bits = 0.0
+#     avg_syms = 0.0
+
+#     # fixed noise variance for eval
+#     snr_lin = 10.0 ** (eval_snr_db / 10.0)
+#     n_var_eval = 1.0 / snr_lin
+
+#     pbar = tqdm(dataloader, desc=f"Eval {eval_snr_db:.1f}dB", leave=False)
+
+#     for batch in pbar:
+#         if isinstance(batch, dict):
+#             input_ids = batch["input_ids"].to(device)
+#             attention_mask = batch["attention_mask"].to(device)
+#             labels = batch["labels"].to(device)
+#         else:
+#             input_ids, attention_mask, labels = batch
+#             input_ids = input_ids.to(device)
+#             attention_mask = attention_mask.to(device)
+#             labels = labels.to(device)
+
+#         logits, rate_bits, route_hard_tx, Ns_eff, stats = model(
+#             input_ids=input_ids,
+#             attention_mask=attention_mask,
+#             n_var=n_var_eval,    # scalar, same for batch
+#             channel="AWGN",
+#             return_probs=False,
+#         )
+
+#         cls_loss = F.cross_entropy(logits, labels)
+#         sym_loss = Ns_eff.float().mean()
+
+#         probs = stats["probs"]
+#         lb_loss = _load_balance_loss_from_probs(probs)
+
+#         vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
+
+#         loss = cls_loss + lambda_sym * sym_loss + lambda_lb * lb_loss + lambda_vq * vq_loss
+
+#         bs = input_ids.size(0)
+#         total_loss_sum += loss.item() * bs
+#         cls_loss_sum += cls_loss.item() * bs
+#         sym_loss_sum += sym_loss.item() * bs
+#         lb_loss_sum += lb_loss.item() * bs
+#         vq_loss_sum += vq_loss.item() * bs
+
+#         preds = logits.argmax(dim=-1)
+#         batch_correct = (preds == labels).sum().item()
+#         correct += batch_correct
+#         n_samples += bs
+
+#         avg_bits += rate_bits.sum().item()
+#         avg_syms += Ns_eff.sum().item()
+
+#         batch_acc = batch_correct / bs
+#         pbar.set_postfix(
+#             loss=f"{loss.item():.4f}",
+#             cls=f"{cls_loss.item():.4f}",
+#             sym=f"{sym_loss.item():.2f}",
+#             lb=f"{lb_loss.item():.3f}",
+#             acc=f"{batch_acc:.3f}",
+#             snr_db=f"{eval_snr_db:.1f}",
+#         )
+
+#     return {
+#         "loss": total_loss_sum / n_samples,
+#         "cls_loss": cls_loss_sum / n_samples,
+#         "sym_loss": sym_loss_sum / n_samples,
+#         "lb_loss": lb_loss_sum / n_samples,
+#         "vq_loss": vq_loss_sum / n_samples,
+#         "accuracy": correct / n_samples,
+#         "avg_bits_per_block": avg_bits / n_samples,
+#         "avg_syms_per_block": avg_syms / n_samples,
+#     }
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from tqdm import tqdm
+from torch.cuda.amp import autocast, GradScaler
+
+def expected_rate_penalty(stats, N, vq_codebook_sizes, phy_M_list, eps=1e-6):
+    """
+    stats must contain:
+      expert_probs: [B,R]
+      phy_probs:    [B,M]
+    Returns:
+      exp_bits_mean, exp_syms_mean  (scalars)
+    """
+    p_e = stats["expert_probs"]   # [B,R]
+    p_m = stats["phy_probs"]      # [B,M]
+
+    device = p_e.device
+    k_r  = torch.tensor([math.log2(K) for K in vq_codebook_sizes], device=device)  # [R]
+    bpsm = torch.tensor([math.log2(M) for M in phy_M_list], device=device)         # [M]
+
+    # expected bits/block (N tokens per block)
+    exp_bits = N * (p_e * k_r).sum(dim=-1)                 # [B]
+
+    # expected bits-per-symbol
+    exp_bps  = (p_m * bpsm).sum(dim=-1).clamp_min(eps)     # [B]
+
+    # approx expected symbols/block
+    exp_syms = exp_bits / exp_bps                          # [B]
+
+    return exp_bits.mean(), exp_syms.mean()
+def _safe_mean(x: torch.Tensor, default: float = 0.0) -> torch.Tensor:
+    if x is None:
+        return torch.tensor(default, device="cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.is_tensor(x):
+        return torch.tensor(float(x))
+    return x.mean() if x.numel() > 0 else torch.tensor(default, device=x.device)
+
+
+@torch.no_grad()
+def _token_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    logits: [B, T, V], labels: [B, T] with ignore_index=-100
+    """
+    pred = logits.argmax(dim=-1)                         # [B, T]
+    mask = labels.ne(-100)
+    if mask.sum().item() == 0:
+        return 0.0
+    correct = (pred.eq(labels) & mask).sum().item()
+    total = mask.sum().item()
+    return correct / total
+
+def router_entropy_loss(expert_probs: torch.Tensor, eps: float = 1e-9):
+    # maximize entropy => minimize negative entropy
+    ent = -(expert_probs * (expert_probs + eps).log()).sum(dim=1).mean()
+    return -ent
+
+def train_one_epoch_rec(
+    model: nn.Module,
+    dataloader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    lambda_vec: float = 1.0,       # latent distortion
+    lambda_sym: float = 0.0,       # symbol-time (latency) penalty
+    lambda_vq: float = 1.0,        # VQ commitment/codebook loss
+    lambda_lb: float = 0.0,        # load-balance regularizer
+    lambda_lat: float = 0.002,     # weight for latent mse loss
+    lambda_ch: float = 0.002,      # weight for channel mse loss
+    lambda_entropy: float = 0.0,   # weight for VQ entropy regularization (prevent routing collapse)
+    lambda_consistency: float = 0.0,  # weight for hard-soft consistency loss (alignment phase)
+    use_hard_forward: bool = False,   # enable hard-forward/soft-backward during alignment
+    gumbel_tau: float = 1.0,          # Gumbel temperature for soft routing when hard_routing=False
+    max_grad_norm: float | None = 1.0,
+    use_amp: bool = False,
+    snr_min_db: float = 0.0,
+    snr_max_db: float = 10.0,
+):
+    """
+    One epoch of training for TEXT RECONSTRUCTION (seq2seq).
+
+    Noise SNR sampled uniformly in [snr_min_db, snr_max_db] per sample.
+
+    Total loss:
+      L = L_task(seq2seq NLL) + lambda_vec * L_latent + lambda_sym * J_sym
+          + lambda_lb * J_lb + lambda_vq * L_VQ
+    """
+    model.train()
+    scaler = GradScaler(enabled=use_amp)
+
+    total_loss_sum = 0.0
+    nll_loss_sum = 0.0
+    vec_loss_sum = 0.0
+    sym_loss_sum = 0.0
+    lb_loss_sum = 0.0
+    vq_loss_sum = 0.0
+    tokacc_sum = 0.0
+    n_samples = 0
+    
+    # Collapse detection metrics
+    vq_entropy_sum = 0.0
+    sym_entropy_sum = 0.0
+    mean_llr_sum = 0.0
+
+    pbar = tqdm(dataloader, desc="Train-REC", leave=False)
+
+    for batch in pbar:
+        # ----- unpack batch -----
+        if isinstance(batch, dict):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)          # [B, T], with -100 padding ideally
+        else:
+            # assume (input_ids, attention_mask, labels)
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+
+        B = input_ids.size(0)
+
+        # ----- sample SNR per sample -----
+        snr_db = torch.empty(B, device=device).uniform_(snr_min_db, snr_max_db)  # [B]
+        snr_lin = 10.0 ** (snr_db / 10.0)                                         # [B]
+        n_var = 1.0 / snr_lin                                                     # [B]
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast(enabled=use_amp):
+            # model should be your upgraded BART+JSCC module:
+            # outputs, rate_bits, route_hard_tx, Ns_eff, stats
+            outputs, rate_bits, route_hard_tx, Ns_eff, stats = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    n_var=n_var,
+                    channel="AWGN",
+                    return_probs=False,
+                    hard_routing=use_hard_forward,
+                    gumbel_tau=gumbel_tau,
+                )
+
+
+            # Task loss: seq2seq NLL (already averaged by HF)
+            nll_loss = outputs.loss
+
+            # Latent distortion: directly access and compute mean
+            latent_mse = stats.get("latent_mse", torch.tensor(0.0, device=device))
+            channel_mse = stats.get("channel_mse", torch.tensor(0.0, device=device))
+            if torch.is_tensor(latent_mse):
+                latent_mse = latent_mse.mean() if latent_mse.numel() > 0 else torch.tensor(0.0, device=device)
+            else:
+                latent_mse = torch.tensor(float(latent_mse), device=device)
+            if torch.is_tensor(channel_mse):
+                channel_mse = channel_mse.mean() if channel_mse.numel() > 0 else torch.tensor(0.0, device=device)
+            else:
+                channel_mse = torch.tensor(float(channel_mse), device=device)
+            vec_loss = latent_mse + channel_mse
+
+            # Symbol-time penalty (optional)
+            # IMPORTANT: keep train loss aligned with eval loss.
+            # Use the transceiver-provided differentiable expected symbols.
+            sym_loss = stats.get("exp_syms_per_block", torch.tensor(0.0, device=device))
+            if torch.is_tensor(sym_loss):
+                sym_loss = sym_loss.mean() if sym_loss.numel() > 0 else torch.tensor(0.0, device=device)
+            else:
+                sym_loss = torch.tensor(float(sym_loss), device=device)
+
+            probs = stats.get("probs", None)
+            lb_loss = _load_balance_loss_from_probs(probs) if probs is not None else torch.tensor(0.0, device=device)
+
+            # VQ loss (optional)
+            vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
+            if not torch.is_tensor(vq_loss):
+                vq_loss = torch.tensor(float(vq_loss), device=device)
+
+            # Total
+            loss = (
+                nll_loss
+                + lambda_vec * vec_loss
+                + lambda_sym * sym_loss
+                + lambda_lb * lb_loss
+                + lambda_vq * vq_loss
+            )
+
+        # ----- backward/step -----
+        if use_amp:
+            scaler.scale(loss).backward()
+            if max_grad_norm is not None:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            if max_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+        # ----- stats -----
+        bs = input_ids.size(0)
+        total_loss_sum += loss.item() * bs
+        nll_loss_sum += nll_loss.item() * bs
+        vec_loss_sum += vec_loss.item() * bs
+        sym_loss_sum += sym_loss.item() * bs
+        lb_loss_sum += lb_loss.item() * bs
+        vq_loss_sum += vq_loss.item() * bs
+
+        tok_acc = _token_accuracy(outputs.logits.detach(), labels.detach())
+        tokacc_sum += tok_acc * bs
+        n_samples += bs
+        
+        # Collapse detection metrics
+        if "vq_entropy" in stats:
+            vq_entropy_sum += stats["vq_entropy"].mean().item() * bs
+        if "sym_entropy" in stats:
+            sym_entropy_sum += stats["sym_entropy"].mean().item() * bs
+        if "mean_llr" in stats:
+            mean_llr_sum += stats["mean_llr"].mean().item() * bs
+
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            nll=f"{nll_loss.item():.4f}",
+            ppl=f"{math.exp(min(20.0, nll_loss.item())):.2f}",
+            vec=f"{vec_loss.item():.4f}",
+            sym=f"{sym_loss.item():.2f}",
+            lb=f"{lb_loss.item():.3f}",
+            tokacc=f"{tok_acc:.3f}",
+            snr_db=f"{snr_db.mean().item():.1f}",
+        )
+
+    avg_nll = nll_loss_sum / max(1, n_samples)
+    metrics = {
+        "loss": total_loss_sum / max(1, n_samples),
+        "nll_loss": avg_nll,
+        "ppl": float(math.exp(min(20.0, avg_nll))),
+        "vec_loss": vec_loss_sum / max(1, n_samples),
+        "sym_loss": sym_loss_sum / max(1, n_samples),
+        "lb_loss": lb_loss_sum / max(1, n_samples),
+        "vq_loss": vq_loss_sum / max(1, n_samples),
+        "token_accuracy": tokacc_sum / max(1, n_samples),
+    }
+    
+    # Add collapse detection metrics if available
+    if vq_entropy_sum > 0:
+        metrics["vq_entropy"] = vq_entropy_sum / n_samples
+    if sym_entropy_sum > 0:
+        metrics["sym_entropy"] = sym_entropy_sum / n_samples
+    if mean_llr_sum > 0:
+        metrics["mean_llr"] = mean_llr_sum / n_samples
+        
+    return metrics
+
+
+@torch.no_grad()
+def eval_one_epoch_rec(
+    model: nn.Module,
+    dataloader,
+    device: torch.device,
+    lambda_vec: float = 1.0,
+    lambda_sym: float = 0.0,
+    lambda_vq: float = 1.0,
+    lambda_lb: float = 0.0,
+    eval_snr_db: float = 5.0,
+):
+    """
+    Evaluation loop for TEXT RECONSTRUCTION (seq2seq).
+
+    Fixed SNR (eval_snr_db) for all samples.
+
+    Total loss:
+      L = L_task(seq2seq NLL) + lambda_vec * L_latent + lambda_sym * J_sym
+          + lambda_lb * J_lb + lambda_vq * L_VQ
+    """
+    model.eval()
+
+    total_loss_sum = 0.0
+    nll_loss_sum = 0.0
+    vec_loss_sum = 0.0
+    sym_loss_sum = 0.0
+    lb_loss_sum = 0.0
+    vq_loss_sum = 0.0
+    tokacc_sum = 0.0
+    n_samples = 0
+
+    avg_bits = 0.0
+    avg_syms = 0.0
+    
+    # Collapse detection metrics
+    vq_entropy_sum = 0.0
+    sym_entropy_sum = 0.0
+    mean_llr_sum = 0.0
+
+    snr_lin = 10.0 ** (eval_snr_db / 10.0)
+    n_var_eval = 1.0 / snr_lin
+
+    pbar = tqdm(dataloader, desc=f"Eval-REC {eval_snr_db:.1f}dB", leave=False)
+
+    for batch in pbar:
+        if isinstance(batch, dict):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+        else:
+            input_ids, attention_mask, labels = batch
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+
+        outputs, rate_bits, route_hard_tx, Ns_eff, stats = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            n_var=n_var_eval,
+            channel="AWGN",
+            return_probs=False,
+        )
+
+        nll_loss = outputs.loss
+
+        # Latent distortion: directly access and compute mean
+        latent_mse = stats.get("latent_mse", torch.tensor(0.0, device=device))
+        channel_mse = stats.get("channel_mse", torch.tensor(0.0, device=device))
+        if torch.is_tensor(latent_mse):
+            latent_mse = latent_mse.mean() if latent_mse.numel() > 0 else torch.tensor(0.0, device=device)
+        else:
+            latent_mse = torch.tensor(float(latent_mse), device=device)
+        if torch.is_tensor(channel_mse):
+            channel_mse = channel_mse.mean() if channel_mse.numel() > 0 else torch.tensor(0.0, device=device)
+        else:
+            channel_mse = torch.tensor(float(channel_mse), device=device)
+        vec_loss = latent_mse + channel_mse
+
+        # IMPORTANT: match train loss definition
+        sym_loss = stats.get("exp_syms_per_block", torch.tensor(0.0, device=device))
+        if torch.is_tensor(sym_loss):
+            sym_loss = sym_loss.mean() if sym_loss.numel() > 0 else torch.tensor(0.0, device=device)
+        else:
+            sym_loss = torch.tensor(float(sym_loss), device=device)
+
+        probs = stats.get("probs", None)
+        lb_loss = _load_balance_loss_from_probs(probs) if probs is not None else torch.tensor(0.0, device=device)
+
+        vq_loss = stats.get("vq_loss", torch.tensor(0.0, device=device))
+        if not torch.is_tensor(vq_loss):
+            vq_loss = torch.tensor(float(vq_loss), device=device)
+
+        loss = (
+            nll_loss
+            + lambda_vec * vec_loss
+            + lambda_sym * sym_loss
+            + lambda_lb * lb_loss
+            + lambda_vq * vq_loss
+        )
+
+        bs = input_ids.size(0)
+        total_loss_sum += loss.item() * bs
+        nll_loss_sum += nll_loss.item() * bs
+        vec_loss_sum += vec_loss.item() * bs
+        sym_loss_sum += sym_loss.item() * bs
+        lb_loss_sum += lb_loss.item() * bs
+        vq_loss_sum += vq_loss.item() * bs
+
+        tok_acc = _token_accuracy(outputs.logits, labels)
+        tokacc_sum += tok_acc * bs
+
+        n_samples += bs
+        avg_bits += float(rate_bits.sum().item()) if rate_bits is not None else 0.0
+        avg_syms += float(Ns_eff.sum().item()) if Ns_eff is not None else 0.0
+        
+        # Collapse detection metrics
+        if "vq_entropy" in stats:
+            vq_entropy_sum += stats["vq_entropy"].mean().item() * bs
+        if "sym_entropy" in stats:
+            sym_entropy_sum += stats["sym_entropy"].mean().item() * bs
+        if "mean_llr" in stats:
+            mean_llr_sum += stats["mean_llr"].mean().item() * bs
+
+        pbar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            nll=f"{nll_loss.item():.4f}",
+            ppl=f"{math.exp(min(20.0, nll_loss.item())):.2f}",
+            vec=f"{vec_loss.item():.4f}",
+            sym=f"{sym_loss.item():.2f}",
+            lb=f"{lb_loss.item():.3f}",
+            tokacc=f"{tok_acc:.3f}",
+            snr_db=f"{eval_snr_db:.1f}",
+        )
+
+    avg_nll = nll_loss_sum / max(1, n_samples)
+    metrics = {
+        "loss": total_loss_sum / max(1, n_samples),
+        "nll_loss": avg_nll,
+        "ppl": float(math.exp(min(20.0, avg_nll))),
+        "vec_loss": vec_loss_sum / max(1, n_samples),
+        "sym_loss": sym_loss_sum / max(1, n_samples),
+        "lb_loss": lb_loss_sum / max(1, n_samples),
+        "vq_loss": vq_loss_sum / max(1, n_samples),
+        "token_accuracy": tokacc_sum / max(1, n_samples),
+        "avg_bits_per_block": avg_bits / max(1, n_samples),
+        "avg_syms_per_block": avg_syms / max(1, n_samples),
+    }
+    
+    # Add collapse detection metrics if available
+    if vq_entropy_sum > 0:
+        metrics["vq_entropy"] = vq_entropy_sum / n_samples
+    if sym_entropy_sum > 0:
+        metrics["sym_entropy"] = sym_entropy_sum / n_samples
+    if mean_llr_sum > 0:
+        metrics["mean_llr"] = mean_llr_sum / n_samples
+        
+    return metrics

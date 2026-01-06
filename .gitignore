@@ -6,3 +6,25 @@ checkpoint_full08_mb copy.pth
 
 # Large checkpoints
 *.pth
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Notebooks (code-only pushes)
+*.ipynb
+
+# Generated plots / figures
+*.png
+*.pdf
+*.eps
+
+# Logs / tmp outputs
+*.log
+*.tmp
+tmp_*.txt
+
+# Experiment dumps
+*.npz
+*.csv
+snr_sweep_outputs/
